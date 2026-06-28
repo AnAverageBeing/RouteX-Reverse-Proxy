@@ -1,0 +1,63 @@
+api:
+  enabled: true
+  bind: "0.0.0.0:9000"
+  api_keys:
+    - key: "pk_live_xxxxxxxxxxxx"
+      label: "grafana-dashboard"
+      permissions: ["metrics:read", "proxies:read"]
+    - key: "pk_admin_xxxxxxxxxxxx"
+      label: "admin"
+      permissions: ["*"]
+  tls:
+    enabled: false
+    cert: ""
+    key: ""
+
+timezone: "UTC"
+
+metrics:
+  enabled: true
+  retention_hours: 168
+  flush_interval_seconds: 10
+  sqlite_path: "./routex_metrics.db"
+  formats: ["json", "prometheus", "influx", "csv"]
+
+network:
+  socket_buffer_size: 65536
+  tcp_keepalive_enabled: true
+  tcp_keepalive_interval: 30
+  tcp_nodelay: true
+  udp_read_buffer: 4194304
+  udp_write_buffer: 4194304
+
+defaults:
+  upstream_connect_timeout: 5s
+  upstream_read_timeout: 30s
+  upstream_write_timeout: 30s
+  client_read_timeout: 30s
+  client_write_timeout: 30s
+  health_check_interval: 10s
+  health_check_timeout: 3s
+  health_check_failures_before_eject: 3
+  health_check_passes_before_readmit: 2
+
+iptables:
+  enabled: true
+  chain_prefix: "ROUTEX"
+  comment_prefix: "RouteX"
+  auto_create_chains: true
+  flush_on_start: false
+  ipv6_enabled: false
+
+acl:
+  enabled: false
+  default_action: "allow"
+  rules: []
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  file_path: "./routex.log"
+  max_size_mb: 100
+  max_backups: 5

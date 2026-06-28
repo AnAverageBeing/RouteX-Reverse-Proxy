@@ -1,0 +1,63 @@
+name: "minecraft-main"
+enabled: true
+description: "Minecraft Java proxy with DDoS protection"
+
+origin-ip: "0.0.0.0"
+origin-port: "25565:25575"
+dest-ip: "10.0.0.1, 10.0.0.2"
+dest-port: "35565:35575"
+one-to-one: true
+protocol: "tcp-udp"
+
+load_balancing:
+  algorithm: "least-conn"
+  sticky_sessions: false
+  sticky_ttl: 3600
+  upstream_weights:
+    "10.0.0.1": 3
+    "10.0.0.2": 1
+  health_check:
+    interval: 10s
+    timeout: 3s
+    failures_before_eject: 3
+    passes_before_readmit: 2
+
+rate_limits:
+  tcp_pps_per_ip: 500
+  udp_pps_per_ip: 1000
+  new_conns_per_sec_per_ip: 20
+  max_simultaneous_conns_per_ip: 10
+  drop_fragmented_packets: true
+  tcp_syn_rate_per_ip: 10
+  tcp_invalid_state_drop: true
+
+l7_protection:
+  enabled: false
+  payload_inspection:
+    enabled: false
+    mode: "minecraft-java"
+
+acl:
+  default_action: "allow"
+  rules: []
+
+bandwidth:
+  enabled: false
+  hourly_limit: 0
+  daily_limit: 0
+  weekly_limit: 0
+  monthly_limit: 0
+  suspend_on_limit: false
+
+connection_draining:
+  enabled: true
+  timeout: 30s
+
+logging:
+  level: "info"
+  log_connections: true
+  log_bytes: false
+
+metadata:
+  tags: ["game", "minecraft", "production"]
+  owner: "infra-team"

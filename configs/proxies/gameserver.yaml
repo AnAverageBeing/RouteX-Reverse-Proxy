@@ -1,0 +1,42 @@
+name: "gameserver-generic"
+enabled: true
+description: "Generic game server TCP proxy"
+
+origin-ip: "0.0.0.0"
+origin-port: "27015:27020"
+
+dest-ip: "10.0.0.3, 10.0.0.4, 10.0.0.5"
+dest-port: "27015"
+
+one-to-one: false
+protocol: "tcp"
+
+load_balancing:
+  algorithm: "round-robin"
+  sticky_sessions: false
+  sticky_ttl: 0
+
+rate_limits:
+  tcp_pps_per_ip: 300
+  new_conns_per_sec_per_ip: 15
+  max_simultaneous_conns_per_ip: 20
+  drop_fragmented_packets: true
+  tcp_syn_rate_per_ip: 8
+  tcp_invalid_state_drop: true
+
+l7_protection:
+  enabled: true
+  payload_inspection:
+    enabled: true
+    mode: "gmod"
+
+acl:
+  default_action: "allow"
+
+connection_draining:
+  enabled: true
+  timeout: 15s
+
+metadata:
+  tags: ["game", "generic"]
+  owner: "infra-team"
