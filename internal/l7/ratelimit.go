@@ -38,6 +38,15 @@ func (tb *TokenBucket) Allow(n float64) bool {
 
 func (tb *TokenBucket) AllowOne() bool { return tb.Allow(1) }
 
+// IsFull reports whether the bucket is at or near capacity (>= 99%).
+// Used by the engine cleanup loop to prune idle token buckets.
+func (tb *TokenBucket) IsFull() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.refill()
+	return tb.tokens >= tb.burst*0.99
+}
+
 func (tb *TokenBucket) refill() {
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()

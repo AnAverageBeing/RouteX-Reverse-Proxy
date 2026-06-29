@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,11 +27,15 @@ type TCPProxy struct {
 	logger    *zap.Logger
 	proxyName string
 
-	acl    ACLChecker
-	bwRec  BytesRecorder
+	acl   ACLChecker
+	bwRec BytesRecorder
 
-	acceptCtx    context.Context
+	// FIX: acceptCancel is written by Start() and read by Stop() from different
+	// goroutines. Guard it with a mutex to prevent the data race.
+	cancelMu     sync.Mutex
 	acceptCancel context.CancelFunc
+	// acceptCtxPtr stores the running context so handleConn goroutines can use it.
+	acceptCtxPtr atomic.Pointer[context.Context]
 
 	activeConns int64
 	totalConns  int64
@@ -81,20 +86,24 @@ func NewTCPProxy(
 }
 
 func (p *TCPProxy) Start(ctx context.Context) error {
-	p.acceptCtx, p.acceptCancel = context.WithCancel(ctx)
-	defer p.acceptCancel()
+	acceptCtx, cancel := context.WithCancel(ctx)
+	p.cancelMu.Lock()
+	p.acceptCancel = cancel
+	p.cancelMu.Unlock()
+	p.acceptCtxPtr.Store(&acceptCtx)
+	defer cancel()
 	p.logger.Info("tcp proxy started", zap.String("addr", p.listener.Addr().String()))
 	for {
 		conn, err := p.listener.Accept()
 		if err != nil {
 			select {
-			case <-p.acceptCtx.Done():
+			case <-acceptCtx.Done():
 				return nil
 			default:
 				p.logger.Error("tcp accept error", zap.Error(err))
 				timer := time.NewTimer(100 * time.Millisecond)
 				select {
-				case <-p.acceptCtx.Done():
+				case <-acceptCtx.Done():
 					timer.Stop()
 					return nil
 				case <-timer.C:
@@ -157,21 +166,30 @@ func (p *TCPProxy) handleConn(client net.Conn) {
 	if err != nil || len(destPorts) == 0 {
 		return
 	}
-	destPort := target.Port()
-	_ = destPorts
+	// FIX #4: use resolver-determined dest port for one-to-one mapping.
+	// destPorts[0] is the correct mapped port for this origin port.
+	// Previously target.Port() was used, which ignores the resolver entirely.
+	destPort := destPorts[0]
 	upstreamAddr := net.JoinHostPort(target.IP().String(), itoa(destPort))
 
 	connInfo := &ConnInfo{
-		ProxyName: p.proxyName, Protocol: "tcp",
-		SrcIP: srcAddr, SrcPort: parsePort(srcPort),
-		UpstreamIP: target.IP(), UpstreamPort: destPort,
-		StartedAt: time.Now(),
+		ProxyName:    p.proxyName,
+		Protocol:     "tcp",
+		SrcIP:        srcAddr,
+		SrcPort:      parsePort(srcPort),
+		UpstreamIP:   target.IP(),
+		UpstreamPort: destPort, // resolver-determined port (correct for one-to-one)
+		StartedAt:    time.Now(),
 	}
 	connInfo = p.tracker.Register(connInfo)
 	defer func() { connInfo.MarkClosed(); p.tracker.Forget(connInfo.ID) }()
 
 	dialer := net.Dialer{Timeout: p.cfg.ConnectTimeout}
-	upstream, err := dialer.DialContext(p.acceptCtx, "tcp", upstreamAddr)
+	runCtx := context.Background()
+	if ptr := p.acceptCtxPtr.Load(); ptr != nil {
+		runCtx = *ptr
+	}
+	upstream, err := dialer.DialContext(runCtx, "tcp", upstreamAddr)
 	if err != nil {
 		return
 	}
@@ -216,8 +234,11 @@ func (p *TCPProxy) handleConn(client net.Conn) {
 }
 
 func (p *TCPProxy) Stop(ctx context.Context) {
-	if p.acceptCancel != nil {
-		p.acceptCancel()
+	p.cancelMu.Lock()
+	cancel := p.acceptCancel
+	p.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	_ = p.listener.Close()
 	p.drainer.Wait(ctx)

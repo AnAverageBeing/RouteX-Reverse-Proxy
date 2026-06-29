@@ -3,7 +3,11 @@ package l7
 import (
 	"bytes"
 	"encoding/binary"
+	"time"
 )
+
+// timeNowUnixNano is the canonical time source for the l7 package.
+func timeNowUnixNano() int64 { return time.Now().UnixNano() }
 
 type ProtocolDetector struct {
 	mode string

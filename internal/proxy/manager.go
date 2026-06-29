@@ -50,11 +50,11 @@ type Manager struct {
 
 func NewManager(global *config.Global, logger *zap.Logger) *Manager {
 	return &Manager{
-		global:             global,
-		logger:             logger,
-		instances:          make(map[string]*Instance),
-		proxyACLs:          make(map[string]ACLChecker),
-		bandwidthTrackers:  make(map[string]*bandwidth.Tracker),
+		global:            global,
+		logger:            logger,
+		instances:         make(map[string]*Instance),
+		proxyACLs:         make(map[string]ACLChecker),
+		bandwidthTrackers: make(map[string]*bandwidth.Tracker),
 	}
 }
 
@@ -65,22 +65,12 @@ func (m *Manager) SetHooks(onStart, onStop func(*Instance)) {
 	m.onInstanceStop = onStop
 }
 
-func (m *Manager) SetGlobalACL(acl ACLChecker) {
-	m.mu.Lock(); m.globalACL = acl; m.mu.Unlock()
-}
-
-func (m *Manager) SetProxyACL(name string, acl ACLChecker) {
-	m.mu.Lock(); m.proxyACLs[name] = acl; m.mu.Unlock()
-}
-
-func (m *Manager) GetProxyACL(name string) ACLChecker {
-	m.mu.RLock(); defer m.mu.RUnlock(); return m.proxyACLs[name]
-}
-
+func (m *Manager) SetGlobalACL(acl ACLChecker)               { m.mu.Lock(); m.globalACL = acl; m.mu.Unlock() }
+func (m *Manager) SetProxyACL(name string, acl ACLChecker)   { m.mu.Lock(); m.proxyACLs[name] = acl; m.mu.Unlock() }
+func (m *Manager) GetProxyACL(name string) ACLChecker         { m.mu.RLock(); defer m.mu.RUnlock(); return m.proxyACLs[name] }
 func (m *Manager) GetBandwidthTracker(name string) *bandwidth.Tracker {
 	m.mu.RLock(); defer m.mu.RUnlock(); return m.bandwidthTrackers[name]
 }
-
 func (m *Manager) AllBandwidthTrackers() map[string]*bandwidth.Tracker {
 	m.mu.RLock(); defer m.mu.RUnlock()
 	out := make(map[string]*bandwidth.Tracker, len(m.bandwidthTrackers))
@@ -99,20 +89,20 @@ func (m *Manager) getComposedACL(proxyName string) ACLChecker {
 	return &composedACL{first: globalACL, second: proxyACL}
 }
 
-type composedACL struct {
-	first  ACLChecker
-	second ACLChecker
-}
+type composedACL struct{ first, second ACLChecker }
 
 func (c *composedACL) Check(ip net.IP) string {
-	if result := c.first.Check(ip); result == "deny" { return "deny" }
+	if c.first.Check(ip) == "deny" { return "deny" }
 	return c.second.Check(ip)
 }
 
 func (m *Manager) Start(proxy *config.Proxy) error {
+	// FIX: unlock before Stop to prevent TOCTOU, re-check after re-lock
 	m.mu.Lock()
 	if _, ok := m.instances[proxy.Name]; ok {
-		m.mu.Unlock(); m.Stop(proxy.Name); m.mu.Lock()
+		m.mu.Unlock()
+		m.Stop(proxy.Name)
+		m.mu.Lock()
 	}
 	inst, err := m.buildInstance(proxy)
 	if err != nil {
@@ -153,10 +143,7 @@ func (m *Manager) StopAll() {
 	}
 }
 
-func (m *Manager) Get(name string) *Instance {
-	m.mu.RLock(); defer m.mu.RUnlock(); return m.instances[name]
-}
-
+func (m *Manager) Get(name string) *Instance    { m.mu.RLock(); defer m.mu.RUnlock(); return m.instances[name] }
 func (m *Manager) List() []string {
 	m.mu.RLock(); defer m.mu.RUnlock()
 	names := make([]string, 0, len(m.instances))
@@ -255,17 +242,31 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 			switch proxy.Protocol {
 			case "tcp", "tcp-udp":
 				tcp, err := NewTCPProxy(proxy.Name, originIP, TCPConfig{
-					OriginPort: port, ConnectTimeout: timeouts.UpstreamConnect,
-					ReadTimeout: timeouts.UpstreamRead, WriteTimeout: timeouts.UpstreamWrite,
-					ClientReadTimeout: timeouts.ClientRead, ClientWriteTimeout: timeouts.ClientWrite,
-					TCPKeepalive: m.global.Network.TCPKeepaliveEnabled,
+					OriginPort:           port,
+					ConnectTimeout:       timeouts.UpstreamConnect,
+					ReadTimeout:          timeouts.UpstreamRead,
+					WriteTimeout:         timeouts.UpstreamWrite,
+					ClientReadTimeout:    timeouts.ClientRead,
+					ClientWriteTimeout:   timeouts.ClientWrite,
+					TCPKeepalive:         m.global.Network.TCPKeepaliveEnabled,
 					TCPKeepaliveInterval: time.Duration(m.global.Network.TCPKeepaliveInterval) * time.Second,
-					TCPNoDelay: m.global.Network.TCPNoDelay,
-					SocketBufferSize: m.global.Network.SocketBufferSize,
-					AccessLog: accessLog,
+					TCPNoDelay:           m.global.Network.TCPNoDelay,
+					SocketBufferSize:     m.global.Network.SocketBufferSize,
+					AccessLog:            accessLog,
 				}, balancerAdapter, resolver, tracker, instLogger, acl, bwRec)
 				if err != nil { return nil, fmt.Errorf("tcp proxy port %d: %w", port, err) }
 				tcpProxies = append(tcpProxies, tcp)
+			}
+			// FIX #1: UDP proxies were never built — this was a stub. Now actually create them.
+			if proxy.Protocol == "udp" || proxy.Protocol == "tcp-udp" {
+				udp, err := NewUDPProxy(proxy.Name, originIP, UDPConfig{
+					OriginPort:      port,
+					ReadBufferSize:  m.global.Network.UDPReadBuffer,
+					WriteBufferSize: m.global.Network.UDPWriteBuffer,
+					SessionTimeout:  timeouts.UDPSessionTimeout,
+				}, balancerAdapter, resolver, tracker, instLogger, acl, bwRec)
+				if err != nil { return nil, fmt.Errorf("udp proxy port %d: %w", port, err) }
+				udpProxies = append(udpProxies, udp)
 			}
 		}
 	}
@@ -315,17 +316,37 @@ func (inst *Instance) Start() error {
 	return nil
 }
 
+// FIX #3: Stop no longer holds inst.mu during the drain wait, preventing
+// deadlocks where concurrent readers (IsRunning, TCPProxies, etc.) would block
+// for the entire drain timeout (up to 30s).
 func (inst *Instance) Stop() {
-	inst.mu.Lock(); defer inst.mu.Unlock()
-	if !inst.running { return }
-	inst.checker.Stop()
-	if inst.cancel != nil { inst.cancel() }
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	for _, tcp := range inst.tcp { tcp.Stop(ctx) }
-	for _, udp := range inst.udp { udp.Stop(ctx) }
-	if inst.eg != nil { _ = inst.eg.Wait() }
+	// Grab the resources we need under the lock, then release before draining.
+	inst.mu.Lock()
+	if !inst.running {
+		inst.mu.Unlock()
+		return
+	}
 	inst.running = false
+	cancel := inst.cancel
+	eg := inst.eg
+	tcp := make([]*TCPProxy, len(inst.tcp))
+	copy(tcp, inst.tcp)
+	udp := make([]*UDPProxy, len(inst.udp))
+	copy(udp, inst.udp)
+	checker := inst.checker
+	inst.mu.Unlock()
+
+	// Stop health probes — non-blocking.
+	checker.Stop()
+	// Cancel the context — signals all Accept loops to stop.
+	if cancel != nil { cancel() }
+
+	// Drain connections outside the lock with a bounded timeout.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer drainCancel()
+	for _, p := range tcp { p.Stop(drainCtx) }
+	for _, p := range udp { p.Stop(drainCtx) }
+	if eg != nil { _ = eg.Wait() }
 }
 
 func (inst *Instance) IsRunning() bool { inst.mu.RLock(); defer inst.mu.RUnlock(); return inst.running }

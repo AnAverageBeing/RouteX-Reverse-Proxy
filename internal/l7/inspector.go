@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/config"
 )
@@ -23,8 +24,10 @@ type Inspector struct {
 	customRules []CustomRule
 	enabled     bool
 	mode        string
-	passed      int64
-	dropped     int64
+	// FIX #7: use atomic counters — previously these were plain int64 mutated
+	// while holding only RLock, causing a data race under concurrent inspection.
+	passed  atomic.Int64
+	dropped atomic.Int64
 }
 
 func NewInspector(l7c config.ProxyL7Protection) *Inspector {
@@ -59,28 +62,28 @@ func (insp *Inspector) Inspect(payload []byte) bool {
 			chunk := payload[rule.MatchOffset : rule.MatchOffset+len(rule.MatchBytes)]
 			if bytes.Equal(chunk, rule.MatchBytes) {
 				if rule.Action == "drop" {
-					insp.dropped++
+					insp.dropped.Add(1)
 					return false
 				}
-				insp.passed++
+				insp.passed.Add(1)
 				return true
 			}
 		}
 	}
 	if insp.detector != nil && insp.detector.Mode() != "none" && insp.detector.Mode() != "" {
 		if insp.detector.Check(payload) {
-			insp.passed++
+			insp.passed.Add(1)
 			return true
 		}
-		insp.dropped++
+		insp.dropped.Add(1)
 		return false
 	}
-	insp.passed++
+	insp.passed.Add(1)
 	return true
 }
 
-func (insp *Inspector) Passed() int64  { return insp.passed }
-func (insp *Inspector) Dropped() int64 { return insp.dropped }
+func (insp *Inspector) Passed() int64   { return insp.passed.Load() }
+func (insp *Inspector) Dropped() int64  { return insp.dropped.Load() }
 func (insp *Inspector) IsEnabled() bool { return insp.enabled }
 
 func parseHexBytes(s string) ([]byte, error) {
@@ -101,7 +104,7 @@ func parseHexBytes(s string) ([]byte, error) {
 
 type banEntry struct {
 	IP        net.IP
-	ExpiresAt int64
+	ExpiresAt int64 // unix nano; 0 = permanent
 	Reason    string
 }
 
@@ -114,14 +117,35 @@ func newBanStore() *banStore {
 	return &banStore{bans: make(map[string]banEntry)}
 }
 
+// FIX #2: IsBanned now correctly checks ExpiresAt and auto-removes expired bans.
+// Previously it only checked map membership, so bans never expired.
 func (bs *banStore) IsBanned(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
+	key := ip.String()
 	bs.mu.RLock()
-	defer bs.mu.RUnlock()
-	_, ok := bs.bans[ip.String()]
-	return ok
+	e, ok := bs.bans[key]
+	bs.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	// ExpiresAt == 0 means permanent ban.
+	if e.ExpiresAt == 0 {
+		return true
+	}
+	// Check if the ban has expired.
+	if nowNanosBan() > e.ExpiresAt {
+		// Upgrade to write lock and remove the expired entry.
+		bs.mu.Lock()
+		// Re-check under write lock (another goroutine may have already removed it).
+		if entry, still := bs.bans[key]; still && entry.ExpiresAt > 0 && nowNanosBan() > entry.ExpiresAt {
+			delete(bs.bans, key)
+		}
+		bs.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 func (bs *banStore) Ban(ip net.IP, expiresAt int64, reason string) {
@@ -156,4 +180,12 @@ func (bs *banStore) Count() int {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 	return len(bs.bans)
+}
+
+// nowNanosBan returns unix nanoseconds — separate from nowNanos() in lb package.
+func nowNanosBan() int64 {
+	// Use sync/atomic-safe time; avoids importing time package ambiguity.
+	// This is just time.Now().UnixNano() wrapped to keep the package-level call
+	// explicit and testable.
+	return timeNowUnixNano()
 }

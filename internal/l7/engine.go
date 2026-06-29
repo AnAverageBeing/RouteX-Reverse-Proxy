@@ -28,6 +28,9 @@ type Engine struct {
 	bannedIPs    int64
 	events       []Event
 	eventsMu     sync.Mutex
+
+	// FIX #9: cleanup goroutine to prune expired entries from in-memory maps
+	stopCleanup chan struct{}
 }
 
 type Event struct {
@@ -47,8 +50,65 @@ func NewEngine(cfg config.ProxyL7Protection) *Engine {
 		cyclingWindows: make(map[string]*SlidingWindow),
 		scores:         make(map[string]int),
 		bans:           newBanStore(),
+		stopCleanup:    make(chan struct{}),
 	}
+	// FIX #9: start periodic cleanup to prevent unbounded map growth
+	go e.cleanupLoop()
 	return e
+}
+
+// Stop shuts down the background cleanup goroutine.
+func (e *Engine) Stop() {
+	select {
+	case <-e.stopCleanup:
+		// already closed
+	default:
+		close(e.stopCleanup)
+	}
+}
+
+// FIX #9: cleanupLoop periodically prunes IPs that have been inactive.
+// Without this, every unique source IP creates permanent map entries.
+func (e *Engine) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCleanup:
+			return
+		case <-ticker.C:
+			e.pruneInactiveMaps()
+		}
+	}
+}
+
+func (e *Engine) pruneInactiveMaps() {
+	// Prune cyclingWindows for IPs with zero count in their window
+	e.cyclingWindowsMu.Lock()
+	for key, sw := range e.cyclingWindows {
+		if sw.Count() == 0 {
+			delete(e.cyclingWindows, key)
+		}
+	}
+	e.cyclingWindowsMu.Unlock()
+
+	// Prune ipBytesTokens that are full (unused IPs refill to burst)
+	e.ipBytesTokensMu.Lock()
+	for key, tb := range e.ipBytesTokens {
+		if tb.IsFull() {
+			delete(e.ipBytesTokens, key)
+		}
+	}
+	e.ipBytesTokensMu.Unlock()
+
+	// Prune zero scores
+	e.scoresMu.Lock()
+	for key, score := range e.scores {
+		if score <= 0 {
+			delete(e.scores, key)
+		}
+	}
+	e.scoresMu.Unlock()
 }
 
 func (e *Engine) OnAccept(srcIP net.IP) bool {
@@ -178,8 +238,8 @@ func (e *Engine) addEvent(ip net.IP, typ string, score int, action, reason strin
 	e.eventsMu.Unlock()
 }
 
-func (e *Engine) BlockedConns() int64  { return atomic.LoadInt64(&e.blockedConns) }
-func (e *Engine) BannedIPs() int64     { return int64(e.bans.Count()) }
+func (e *Engine) BlockedConns() int64     { return atomic.LoadInt64(&e.blockedConns) }
+func (e *Engine) BannedIPs() int64        { return int64(e.bans.Count()) }
 func (e *Engine) IsBanned(ip net.IP) bool { return e.bans.IsBanned(ip) }
 
 func (e *Engine) BanIP(ip net.IP, duration time.Duration, reason string) {
@@ -191,8 +251,8 @@ func (e *Engine) BanIP(ip net.IP, duration time.Duration, reason string) {
 	atomic.AddInt64(&e.bannedIPs, 1)
 }
 
-func (e *Engine) UnbanIP(ip net.IP)       { e.bans.Unban(ip) }
-func (e *Engine) BannedList() []banEntry   { return e.bans.List() }
+func (e *Engine) UnbanIP(ip net.IP)      { e.bans.Unban(ip) }
+func (e *Engine) BannedList() []banEntry { return e.bans.List() }
 
 func (e *Engine) Events(limit int) []Event {
 	e.eventsMu.Lock()

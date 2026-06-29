@@ -19,6 +19,11 @@ type UDPProxy struct {
 	logger    *zap.Logger
 	proxyName string
 
+	// FIX #8: added ACL and bandwidth recorder (were missing — ACL rules silently
+	// ignored and UDP bytes never counted toward bandwidth quotas)
+	acl   ACLChecker
+	bwRec BytesRecorder
+
 	acceptCtx    context.Context
 	acceptCancel context.CancelFunc
 
@@ -48,10 +53,12 @@ type udpSession struct {
 	cancel       context.CancelFunc
 }
 
+// FIX #8: NewUDPProxy now accepts ACL and BytesRecorder parameters.
 func NewUDPProxy(
 	proxyName string, originIP net.IP, cfg UDPConfig,
 	balancer *BalancerAdapter, resolver *Resolver,
 	tracker *ConnTracker, logger *zap.Logger,
+	acl ACLChecker, bwRec BytesRecorder,
 ) (*UDPProxy, error) {
 	addr := &net.UDPAddr{IP: originIP, Port: cfg.OriginPort}
 	conn, err := net.ListenUDP("udp", addr)
@@ -64,6 +71,10 @@ func NewUDPProxy(
 	if cfg.WriteBufferSize > 0 {
 		_ = conn.SetWriteBuffer(cfg.WriteBufferSize)
 	}
+	// Use a minimum 1-second session timeout to avoid zero-duration ticker panic.
+	if cfg.SessionTimeout < time.Second {
+		cfg.SessionTimeout = 60 * time.Second
+	}
 	return &UDPProxy{
 		cfg: cfg, conn: conn, balancer: balancer, resolver: resolver,
 		tracker: tracker,
@@ -74,6 +85,8 @@ func NewUDPProxy(
 		),
 		proxyName: proxyName,
 		sessions:  make(map[string]*udpSession),
+		acl:       acl,
+		bwRec:     bwRec,
 	}, nil
 }
 
@@ -93,9 +106,20 @@ func (p *UDPProxy) Start(ctx context.Context) error {
 				continue
 			}
 		}
+
+		// FIX #8: ACL check per source IP for UDP (was completely missing before)
+		if p.acl != nil && p.acl.Check(remoteAddr.IP) == "deny" {
+			continue
+		}
+
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		atomic.AddInt64(&p.bytesIn, int64(n))
+		// FIX #8: record inbound bytes toward bandwidth quota
+		if p.bwRec != nil {
+			p.bwRec.RecordIn(int64(n))
+		}
+
 		key := remoteAddr.String()
 		sess := p.getOrCreateSession(remoteAddr, key)
 		if sess == nil {
@@ -133,8 +157,9 @@ func (p *UDPProxy) getOrCreateSession(clientAddr *net.UDPAddr, key string) *udpS
 		p.balancer.Release(target)
 		return nil
 	}
-	destPort := target.Port()
-	_ = destPorts
+	// FIX #4 (UDP side): use the resolver-determined dest port for one-to-one
+	// mapping. destPorts[0] is the correct mapped port for this origin port.
+	destPort := destPorts[0]
 	upstreamAddr := &net.UDPAddr{IP: target.IP(), Port: destPort}
 	upstreamConn, err := net.DialUDP("udp", nil, upstreamAddr)
 	if err != nil {
@@ -187,6 +212,10 @@ func (p *UDPProxy) readUpstream(key string, sess *udpSession, clientAddr *net.UD
 		}
 		atomic.AddInt64(&p.bytesOut, int64(n))
 		atomic.AddInt64(&sess.connInfo.bytesOut, int64(n))
+		// FIX #8: record outbound bytes toward bandwidth quota
+		if p.bwRec != nil {
+			p.bwRec.RecordOut(int64(n))
+		}
 		_, err = p.conn.WriteToUDP(buf[:n], clientAddr)
 		if err != nil {
 			return
