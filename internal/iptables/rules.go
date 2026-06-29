@@ -136,6 +136,24 @@ func BuildRules(proxyName string, ports []int, rl config.ProxyRateLimits, protoc
 		})
 	}
 
+	// FIX: TCPRSTRatePerIP was configured but never built into rules.
+	if rl.TCPRSTRatePerIP > 0 && (protocol == "tcp" || protocol == "tcp-udp") {
+		rules = append(rules, Rule{
+			Table: "filter", Chain: "INPUT",
+			Comment: comment(commentPrefix, "RST-Rate", ports),
+			Spec: []string{
+				"-p", "tcp", "--dport", portStr,
+				"--tcp-flags", "RST", "RST",
+				"-m", "hashlimit",
+				"--hashlimit-name", fmt.Sprintf("routex_rst_%s", proxyName),
+				"--hashlimit-above", fmt.Sprintf("%d/sec", rl.TCPRSTRatePerIP),
+				"--hashlimit-mode", "srcip",
+				"-m", "comment", "--comment", comment(commentPrefix, "RST-Rate", ports),
+				"-j", "DROP",
+			},
+		})
+	}
+
 	return rules
 }
 

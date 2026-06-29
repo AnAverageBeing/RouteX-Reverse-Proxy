@@ -31,6 +31,9 @@ type Instance struct {
 
 	cancel context.CancelFunc
 	eg     *errgroup.Group
+
+	// bwTracker is stored here so Stop() can call Close() to stop the cleanup goroutine.
+	bwTracker *bandwidth.Tracker
 }
 
 type Manager struct {
@@ -65,9 +68,9 @@ func (m *Manager) SetHooks(onStart, onStop func(*Instance)) {
 	m.onInstanceStop = onStop
 }
 
-func (m *Manager) SetGlobalACL(acl ACLChecker)               { m.mu.Lock(); m.globalACL = acl; m.mu.Unlock() }
-func (m *Manager) SetProxyACL(name string, acl ACLChecker)   { m.mu.Lock(); m.proxyACLs[name] = acl; m.mu.Unlock() }
-func (m *Manager) GetProxyACL(name string) ACLChecker         { m.mu.RLock(); defer m.mu.RUnlock(); return m.proxyACLs[name] }
+func (m *Manager) SetGlobalACL(acl ACLChecker)             { m.mu.Lock(); m.globalACL = acl; m.mu.Unlock() }
+func (m *Manager) SetProxyACL(name string, acl ACLChecker) { m.mu.Lock(); m.proxyACLs[name] = acl; m.mu.Unlock() }
+func (m *Manager) GetProxyACL(name string) ACLChecker       { m.mu.RLock(); defer m.mu.RUnlock(); return m.proxyACLs[name] }
 func (m *Manager) GetBandwidthTracker(name string) *bandwidth.Tracker {
 	m.mu.RLock(); defer m.mu.RUnlock(); return m.bandwidthTrackers[name]
 }
@@ -97,12 +100,9 @@ func (c *composedACL) Check(ip net.IP) string {
 }
 
 func (m *Manager) Start(proxy *config.Proxy) error {
-	// FIX: unlock before Stop to prevent TOCTOU, re-check after re-lock
 	m.mu.Lock()
 	if _, ok := m.instances[proxy.Name]; ok {
-		m.mu.Unlock()
-		m.Stop(proxy.Name)
-		m.mu.Lock()
+		m.mu.Unlock(); m.Stop(proxy.Name); m.mu.Lock()
 	}
 	inst, err := m.buildInstance(proxy)
 	if err != nil {
@@ -219,19 +219,20 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	acl := m.getComposedACL(proxy.Name)
 	accessLog := proxy.Logging.LogConnections
 
-	// Bandwidth tracker
+	// Bandwidth tracker — stored on Instance so Stop() can close it.
 	var bwRec BytesRecorder
+	var bwTracker *bandwidth.Tracker
 	if proxy.Bandwidth.Enabled && !proxy.Bandwidth.IsZero() {
 		loc := time.UTC
 		if m.global.Timezone != "" {
 			if l, err := time.LoadLocation(m.global.Timezone); err == nil { loc = l }
 		}
-		bw := bandwidth.NewTracker(proxy.Name, bandwidth.Quota{
+		bwTracker = bandwidth.NewTracker(proxy.Name, bandwidth.Quota{
 			Hourly: proxy.Bandwidth.HourlyLimit, Daily: proxy.Bandwidth.DailyLimit,
 			Weekly: proxy.Bandwidth.WeeklyLimit, Monthly: proxy.Bandwidth.MonthlyLimit,
 		}, loc)
-		bwRec = bw
-		m.bandwidthTrackers[proxy.Name] = bw
+		bwRec = bwTracker
+		m.bandwidthTrackers[proxy.Name] = bwTracker
 	}
 
 	var tcpProxies []*TCPProxy
@@ -257,7 +258,6 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 				if err != nil { return nil, fmt.Errorf("tcp proxy port %d: %w", port, err) }
 				tcpProxies = append(tcpProxies, tcp)
 			}
-			// FIX #1: UDP proxies were never built — this was a stub. Now actually create them.
 			if proxy.Protocol == "udp" || proxy.Protocol == "tcp-udp" {
 				udp, err := NewUDPProxy(proxy.Name, originIP, UDPConfig{
 					OriginPort:      port,
@@ -291,8 +291,8 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	checker, err := health.New(hcCfg, healthTargets, bal.SetHealth, instLogger)
 	if err != nil { return nil, fmt.Errorf("health checker: %w", err) }
 
-	// Start sticky table cleanup ticker if sticky sessions are enabled.
-	// Expired entries otherwise accumulate for the lifetime of the proxy instance.
+	// FIX: sticky table cleanup goroutine is now bound to the instance context
+	// so it stops when the proxy stops (previously leaked forever).
 	if proxy.LoadBalancing.StickySessions {
 		go func() {
 			ticker := time.NewTicker(1 * time.Minute)
@@ -306,7 +306,7 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	return &Instance{
 		Name: proxy.Name, Config: proxy, global: m.global, logger: instLogger,
 		tcp: tcpProxies, udp: udpProxies, balancer: balancerAdapter,
-		tracker: tracker, checker: checker,
+		tracker: tracker, checker: checker, bwTracker: bwTracker,
 	}, nil
 }
 
@@ -328,11 +328,8 @@ func (inst *Instance) Start() error {
 	return nil
 }
 
-// FIX #3: Stop no longer holds inst.mu during the drain wait, preventing
-// deadlocks where concurrent readers (IsRunning, TCPProxies, etc.) would block
-// for the entire drain timeout (up to 30s).
+// Stop drains all connections and releases all resources.
 func (inst *Instance) Stop() {
-	// Grab the resources we need under the lock, then release before draining.
 	inst.mu.Lock()
 	if !inst.running {
 		inst.mu.Unlock()
@@ -346,19 +343,22 @@ func (inst *Instance) Stop() {
 	udp := make([]*UDPProxy, len(inst.udp))
 	copy(udp, inst.udp)
 	checker := inst.checker
+	bwTracker := inst.bwTracker
 	inst.mu.Unlock()
 
-	// Stop health probes — non-blocking.
 	checker.Stop()
-	// Cancel the context — signals all Accept loops to stop.
 	if cancel != nil { cancel() }
 
-	// Drain connections outside the lock with a bounded timeout.
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer drainCancel()
 	for _, p := range tcp { p.Stop(drainCtx) }
 	for _, p := range udp { p.Stop(drainCtx) }
 	if eg != nil { _ = eg.Wait() }
+
+	// FIX: close bandwidth tracker to stop its hourly cleanup goroutine.
+	if bwTracker != nil {
+		bwTracker.Close()
+	}
 }
 
 func (inst *Instance) IsRunning() bool { inst.mu.RLock(); defer inst.mu.RUnlock(); return inst.running }

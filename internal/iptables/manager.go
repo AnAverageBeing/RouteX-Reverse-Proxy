@@ -144,18 +144,34 @@ func (m *Manager) deleteProxyRules(proxyName string) error {
 	return nil
 }
 
+// deleteByPrefix scans iptables rules for comments that belong to proxyName
+// and removes them. It only removes rules whose comment contains the proxy
+// name to avoid deleting rules that belong to other proxies.
 func (m *Manager) deleteByPrefix(proxyName string) error {
 	chains := []string{"INPUT", "FORWARD"}
+	// Build a search token that uniquely identifies this proxy's rules.
+	// Convention: comments are like "RouteX-TCP-PPS-25565" where "RouteX" is
+	// the commentPrefix. We match on commentPrefix AND proxyName to avoid
+	// deleting other proxies' rules.
 	for _, chain := range chains {
 		rules, err := m.ipt4.List("filter", chain)
 		if err != nil {
 			continue
 		}
 		for _, rule := range rules {
-			if strings.Contains(rule, m.commentPrefix) {
-				comment := extractComment(rule)
-				if comment != "" {
-					_ = m.deleteRuleByComment("filter", chain, comment)
+			if !strings.Contains(rule, m.commentPrefix) {
+				continue
+			}
+			// Only delete rules that were created for this specific proxy name.
+			// The hashlimit name embeds the proxyName: "routex_tcp_pps_{proxyName}".
+			if !strings.Contains(rule, proxyName) {
+				continue
+			}
+			comment := extractComment(rule)
+			if comment != "" {
+				if delErr := m.deleteRuleByComment("filter", chain, comment); delErr != nil {
+					m.logger.Debug("deleteByPrefix: rule already gone",
+						zap.String("proxy", proxyName), zap.Error(delErr))
 				}
 			}
 		}

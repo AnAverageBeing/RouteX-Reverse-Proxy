@@ -226,6 +226,49 @@ func main() {
 		}()
 	}
 
+	// ── Config Watcher (hot reload) ───────────────────────────────────────
+	watcher, watchErr := config.NewWatcher(*globalCfgPath, *proxiesDir, logger)
+	if watchErr != nil {
+		logger.Warn("config watcher init failed — hot reload disabled", zap.Error(watchErr))
+	} else {
+		defer watcher.Close()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ch, ok := <-watcher.Events():
+					if !ok {
+						return
+					}
+					if ch.IsGlobal {
+						logger.Info("global config changed — full reload not yet supported; restart to apply")
+						continue
+					}
+					// Per-proxy file changed: reload only that proxy.
+					p, loadErr := config.LoadProxy(ch.Path)
+					if loadErr != nil {
+						logger.Error("hot reload: config parse failed",
+							zap.String("path", ch.Path), zap.Error(loadErr))
+						continue
+					}
+					if ch.Kind == config.ChangeRemove {
+						proxyMgr.Stop(p.Name)
+						logger.Info("hot reload: proxy removed", zap.String("name", p.Name))
+					} else {
+						if startErr := proxyMgr.Start(p); startErr != nil {
+							logger.Error("hot reload: proxy restart failed",
+								zap.String("name", p.Name), zap.Error(startErr))
+						} else {
+							logger.Info("hot reload: proxy reloaded", zap.String("name", p.Name))
+						}
+					}
+				}
+			}
+		}()
+		logger.Info("config watcher started — hot reload enabled")
+	}
+
 	// ── Shutdown ──────────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
