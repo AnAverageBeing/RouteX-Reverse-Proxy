@@ -195,6 +195,27 @@ func (s *stickyTable) len() int {
 	return len(s.m)
 }
 
+// prune removes entries that have expired. Called periodically to prevent
+// unbounded growth when many unique source IPs connect over time.
+func (s *stickyTable) prune(now int64) {
+	s.mu.Lock()
+	for key, e := range s.m {
+		if e.expiry <= now {
+			delete(s.m, key)
+		}
+	}
+	s.mu.Unlock()
+}
+
+// PruneStickyTable removes expired sticky session entries. Safe to call
+// periodically from an external ticker (e.g., every minute).
+func (b *Balancer) PruneStickyTable() {
+	if b.sticky == nil {
+		return
+	}
+	b.sticky.prune(nowNanos())
+}
+
 // ErrNoHealthyTargets is returned by Pick when every target is unhealthy.
 var ErrNoHealthyTargets = errors.New("lb: no healthy upstream targets available")
 

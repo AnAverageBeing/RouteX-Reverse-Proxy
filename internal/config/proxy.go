@@ -31,7 +31,10 @@ func LoadProxy(path string) (*Proxy, error) {
 	var p Proxy
 	p.ConfigPath = path
 	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	dec.KnownFields(true)
+	// Use KnownFields(false) for forward compatibility — unknown fields are
+	// silently ignored rather than causing a fatal parse error. This allows
+	// RouteX to start with configs that have fields added in newer versions.
+	dec.KnownFields(false)
 	if err := dec.Decode(&p); err != nil {
 		return nil, &ConfigError{
 			File:   path,

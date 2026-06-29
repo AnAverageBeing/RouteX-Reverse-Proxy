@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -82,7 +83,7 @@ func main() {
 		}
 	}
 
-	// ── ACL Engine (Global) ───────────────────────────────────────────────
+	// ── Global ACL ────────────────────────────────────────────────────────
 	var globalACL *acl.Engine
 	if global.ACL.Enabled {
 		defaultAction := acl.Action(global.ACL.DefaultAction)
@@ -105,9 +106,13 @@ func main() {
 		}
 	}
 
-	// ── Proxy Manager + ACLs ──────────────────────────────────────────────
+	// ── Proxy Manager ─────────────────────────────────────────────────────
 	proxyMgr := proxy.NewManager(global, logger)
 	proxyMgr.SetGlobalACL(globalACL)
+
+	// FIX: protect l7Engines map with a mutex — it is written in hook goroutines
+	// and read from API handler goroutines, creating a data race.
+	var l7Mu sync.RWMutex
 	l7Engines := make(map[string]*l7.Engine)
 	proxyACLs := make(map[string]*acl.Engine)
 
@@ -122,15 +127,17 @@ func main() {
 					inst.Config.Protocol,
 					global.Iptables.CommentPrefix,
 				)
-				if err := iptMgr.ApplyRules(inst.Name, ports, rules); err != nil {
+				if applyErr := iptMgr.ApplyRules(inst.Name, ports, rules); applyErr != nil {
 					logger.Error("iptables apply failed",
-						zap.String("proxy", inst.Name), zap.Error(err))
+						zap.String("proxy", inst.Name), zap.Error(applyErr))
 				}
 			}
 			// L7
 			if inst.Config.L7Protection.Enabled {
 				eng := l7.NewEngine(inst.Config.L7Protection)
+				l7Mu.Lock()
 				l7Engines[inst.Name] = eng
+				l7Mu.Unlock()
 			}
 			// Per-proxy ACL
 			if inst.Config.ACL.DefaultAction != "" {
@@ -144,8 +151,8 @@ func main() {
 						Action: acl.Action(r.Action), CIDR: r.CIDR, Comment: r.Comment,
 					})
 				}
-				pac, err := acl.NewEngine(inst.Name, da, rules, true)
-				if err == nil {
+				pac, aclErr := acl.NewEngine(inst.Name, da, rules, true)
+				if aclErr == nil {
 					proxyACLs[inst.Name] = pac
 					proxyMgr.SetProxyACL(inst.Name, pac)
 				}
@@ -155,15 +162,21 @@ func main() {
 			if iptMgr != nil {
 				_ = iptMgr.FlushProxy(inst.Name)
 			}
-			delete(l7Engines, inst.Name)
+			// FIX: stop the L7 engine's cleanup goroutine to prevent goroutine leak
+			l7Mu.Lock()
+			if eng, ok := l7Engines[inst.Name]; ok {
+				eng.Stop()
+				delete(l7Engines, inst.Name)
+			}
+			l7Mu.Unlock()
 			delete(proxyACLs, inst.Name)
 		},
 	)
 
 	for _, p := range proxies {
-		if err := proxyMgr.Start(p); err != nil {
+		if startErr := proxyMgr.Start(p); startErr != nil {
 			logger.Error("failed to start proxy",
-				zap.String("name", p.Name), zap.Error(err))
+				zap.String("name", p.Name), zap.Error(startErr))
 		}
 	}
 
@@ -190,7 +203,15 @@ func main() {
 
 	// ── API Server ────────────────────────────────────────────────────────
 	if global.API.Enabled {
-		apiRouter := api.NewRouter(global, proxyMgr, iptMgr, l7Engines, metAPI, logger, Version, globalACL, proxyACLs)
+		// FIX: wrap l7Engines map access with mutex-safe snapshot for API
+		l7Mu.RLock()
+		l7Snap := make(map[string]*l7.Engine, len(l7Engines))
+		for k, v := range l7Engines {
+			l7Snap[k] = v
+		}
+		l7Mu.RUnlock()
+
+		apiRouter := api.NewRouter(global, proxyMgr, iptMgr, l7Snap, metAPI, logger, Version, globalACL, proxyACLs)
 		var tlsCfg *api.TLSConfig
 		if global.API.TLS.Enabled {
 			tlsCfg = &api.TLSConfig{
@@ -199,8 +220,8 @@ func main() {
 		}
 		apiSrv := api.NewServer(global.API.Bind, apiRouter, tlsCfg, logger)
 		go func() {
-			if err := apiSrv.Start(ctx); err != nil {
-				logger.Error("API server error", zap.Error(err))
+			if startErr := apiSrv.Start(ctx); startErr != nil {
+				logger.Error("API server error", zap.Error(startErr))
 			}
 		}()
 	}
@@ -241,8 +262,8 @@ func buildLogger(g *config.Global) *zap.Logger {
 	} else {
 		cfg.OutputPaths = []string{"stdout"}
 	}
-	logger, err := cfg.Build()
-	if err != nil {
+	logger, buildErr := cfg.Build()
+	if buildErr != nil {
 		return zap.NewNop()
 	}
 	return logger

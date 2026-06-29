@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -131,4 +130,4 @@ func writeCSV(w http.ResponseWriter, metrics map[string]interface{}) {
 	wr.Flush()
 }
 
-var _ = strconv.Itoa
+

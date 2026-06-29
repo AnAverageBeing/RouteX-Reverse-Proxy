@@ -191,36 +191,45 @@ func (s *Store) flushAll() {
 
 	now := time.Now().Unix()
 	for name, m := range cache {
-		_, _ = s.db.Exec(
+		if _, dbErr := s.db.Exec(
 			`INSERT INTO proxy_metrics (proxy_name, timestamp, active_connections, total_connections,
 			 bytes_in, bytes_out, l7_blocked, l7_banned, iptables_rules_active, rate_limited_drops)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			name, now,
-			atomic.LoadInt64(&m.ActiveConnections),
-			atomic.LoadInt64(&m.TotalConnections),
-			atomic.LoadInt64(&m.BytesIn),
-			atomic.LoadInt64(&m.BytesOut),
-			atomic.LoadInt64(&m.L7BlockedConnections),
-			atomic.LoadInt64(&m.L7BannedIPs),
-			atomic.LoadInt64(&m.IptablesRulesActive),
-			atomic.LoadInt64(&m.RateLimitedDrops),
-		)
+			m.ActiveConnections,
+			m.TotalConnections,
+			m.BytesIn,
+			m.BytesOut,
+			m.L7BlockedConnections,
+			m.L7BannedIPs,
+			m.IptablesRulesActive,
+			m.RateLimitedDrops,
+		); dbErr != nil {
+			s.logger.Error("metrics: failed to flush proxy metrics", zap.String("proxy", name), zap.Error(dbErr))
+		}
 		for _, u := range m.Upstreams {
-			_, _ = s.db.Exec(
+			if _, dbErr := s.db.Exec(
 				`INSERT INTO upstream_metrics (proxy_name, upstream_ip, upstream_port, timestamp,
 				 active_conns, total_conns, total_bytes, healthy, fail_count)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				name, u.IP, u.Port, now,
-				atomic.LoadInt64(&u.ActiveConns),
-				atomic.LoadInt64(&u.TotalConns),
-				atomic.LoadInt64(&u.TotalBytes),
-				atomic.LoadInt64(&u.Healthy),
-				atomic.LoadInt64(&u.FailCount),
-			)
+				u.ActiveConns,
+				u.TotalConns,
+				u.TotalBytes,
+				u.Healthy,
+				u.FailCount,
+			); dbErr != nil {
+				s.logger.Error("metrics: failed to flush upstream metrics",
+					zap.String("proxy", name), zap.String("upstream", u.IP), zap.Error(dbErr))
+			}
 		}
 	}
 
 	cutoff := time.Now().Add(-s.retention).Unix()
-	_, _ = s.db.Exec(`DELETE FROM proxy_metrics WHERE timestamp < ?`, cutoff)
-	_, _ = s.db.Exec(`DELETE FROM upstream_metrics WHERE timestamp < ?`, cutoff)
+	if _, dbErr := s.db.Exec(`DELETE FROM proxy_metrics WHERE timestamp < ?`, cutoff); dbErr != nil {
+		s.logger.Warn("metrics: failed to prune proxy_metrics", zap.Error(dbErr))
+	}
+	if _, dbErr := s.db.Exec(`DELETE FROM upstream_metrics WHERE timestamp < ?`, cutoff); dbErr != nil {
+		s.logger.Warn("metrics: failed to prune upstream_metrics", zap.Error(dbErr))
+	}
 }

@@ -291,6 +291,18 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	checker, err := health.New(hcCfg, healthTargets, bal.SetHealth, instLogger)
 	if err != nil { return nil, fmt.Errorf("health checker: %w", err) }
 
+	// Start sticky table cleanup ticker if sticky sessions are enabled.
+	// Expired entries otherwise accumulate for the lifetime of the proxy instance.
+	if proxy.LoadBalancing.StickySessions {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				bal.PruneStickyTable()
+			}
+		}()
+	}
+
 	return &Instance{
 		Name: proxy.Name, Config: proxy, global: m.global, logger: instLogger,
 		tcp: tcpProxies, udp: udpProxies, balancer: balancerAdapter,

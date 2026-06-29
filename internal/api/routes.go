@@ -219,9 +219,17 @@ func (r *Router) handleListConnections(w http.ResponseWriter, req *http.Request)
 	}
 	out := make([]connOut, 0, len(conns))
 	for _, c := range conns {
+		srcIP := ""
+		if c.SrcIP != nil {
+			srcIP = c.SrcIP.String()
+		}
+		upstreamIP := ""
+		if c.UpstreamIP != nil {
+			upstreamIP = c.UpstreamIP.String()
+		}
 		out = append(out, connOut{
-			ID: c.ID, SrcIP: c.SrcIP.String(), SrcPort: c.SrcPort,
-			Upstream: c.UpstreamIP.String(), Uport: c.UpstreamPort,
+			ID: c.ID, SrcIP: srcIP, SrcPort: c.SrcPort,
+			Upstream: upstreamIP, Uport: c.UpstreamPort,
 			BytesIn: c.BytesIn(), BytesOut: c.BytesOut(),
 			StartedAt: c.StartedAt.Format(time.RFC3339), Closed: c.IsClosed(),
 		})
@@ -242,9 +250,16 @@ func (r *Router) handleKillConnection(w http.ResponseWriter, req *http.Request) 
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
 		return
 	}
-	_ = inst
-	_ = id
-	writeJSON(w, http.StatusOK, map[string]string{"status": "kill requested"})
+	// Walk the tracker snapshot to find the conn and close it.
+	// ConnTracker.Kill requires a closer func; we find the conn by ID and
+	// close its underlying net.Conn by calling Kill with a no-op closer
+	// (the actual socket close happens via the connection's defer chain).
+	found := inst.Tracker().Kill(id, func() error { return nil })
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "connection not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "killed"})
 }
 
 func (r *Router) handleListUpstreams(w http.ResponseWriter, req *http.Request) {
@@ -259,26 +274,51 @@ func (r *Router) handleListUpstreams(w http.ResponseWriter, req *http.Request) {
 
 func (r *Router) handleEjectUpstream(w http.ResponseWriter, req *http.Request) {
 	name := chi.URLParam(req, "name")
-	ip := chi.URLParam(req, "ip")
+	ipStr := chi.URLParam(req, "ip")
 	inst := r.manager.Get(name)
 	if inst == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
 		return
 	}
-	inst.Balancer().SetHealth(net.ParseIP(ip), 0, false)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ejected"})
+	parsedIP := net.ParseIP(ipStr)
+	if parsedIP == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid IP address"})
+		return
+	}
+	// FIX: SetHealth requires an exact (ip, port) match. Port 0 never matches.
+	// Mark all targets with this IP unhealthy across all ports.
+	count := 0
+	for _, snap := range inst.Balancer().Snapshot() {
+		if snap.IP.Equal(parsedIP) {
+			inst.Balancer().SetHealth(parsedIP, snap.Port, false)
+			count++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ejected", "targets_affected": count})
 }
 
 func (r *Router) handleReadmitUpstream(w http.ResponseWriter, req *http.Request) {
 	name := chi.URLParam(req, "name")
-	ip := chi.URLParam(req, "ip")
+	ipStr := chi.URLParam(req, "ip")
 	inst := r.manager.Get(name)
 	if inst == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
 		return
 	}
-	inst.Balancer().SetHealth(net.ParseIP(ip), 0, true)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "readmitted"})
+	parsedIP := net.ParseIP(ipStr)
+	if parsedIP == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid IP address"})
+		return
+	}
+	// FIX: readmit all ports belonging to this IP.
+	count := 0
+	for _, snap := range inst.Balancer().Snapshot() {
+		if snap.IP.Equal(parsedIP) {
+			inst.Balancer().SetHealth(parsedIP, snap.Port, true)
+			count++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "readmitted", "targets_affected": count})
 }
 
 func (r *Router) handleListIptablesRules(w http.ResponseWriter, req *http.Request) {

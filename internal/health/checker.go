@@ -61,7 +61,9 @@ type Checker struct {
 	logger   *zap.Logger
 
 	// state per target index: consecutive failure and success counters.
-	mu        sync.Mutex
+	// FIX: changed from sync.Mutex to sync.RWMutex so Healthy() can use RLock
+	// instead of a full write lock — it's a read-only operation.
+	mu        sync.RWMutex
 	fail      []int
 	pass      []int
 	healthySn []bool // last announced state so we only fire onChange on diffs.
@@ -132,8 +134,8 @@ func (c *Checker) Stop() {
 // When probes have never completed, returns true (optimistic) so freshly
 // started checkers don't immediately eject all upstreams.
 func (c *Checker) Healthy(ip net.IP, port int) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for i, t := range c.targets {
 		if t.IP.Equal(ip) && t.Port == port {
 			return c.healthySn[i]

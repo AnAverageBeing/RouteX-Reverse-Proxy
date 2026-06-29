@@ -10,6 +10,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// nowNanoUDP returns current unix nanoseconds for session activity tracking.
+func nowNanoUDP() int64 { return time.Now().UnixNano() }
+
 type UDPProxy struct {
 	cfg       UDPConfig
 	conn      *net.UDPConn
@@ -48,9 +51,12 @@ type udpSession struct {
 	upstreamAddr *net.UDPAddr
 	target       *Target
 	connInfo     *ConnInfo
-	lastActivity time.Time
 	ctx          context.Context
 	cancel       context.CancelFunc
+	// FIX: lastActivity is read by the reaper goroutine and written by
+	// getOrCreateSession and readUpstream concurrently. Use atomic int64
+	// (unix nanoseconds) to avoid the data race.
+	lastActivity atomic.Int64
 }
 
 // FIX #8: NewUDPProxy now accepts ACL and BytesRecorder parameters.
@@ -139,13 +145,13 @@ func (p *UDPProxy) getOrCreateSession(clientAddr *net.UDPAddr, key string) *udpS
 	sess, ok := p.sessions[key]
 	p.sessionsMu.RUnlock()
 	if ok {
-		sess.lastActivity = time.Now()
+		sess.lastActivity.Store(nowNanoUDP())
 		return sess
 	}
 	p.sessionsMu.Lock()
 	defer p.sessionsMu.Unlock()
 	if sess, ok = p.sessions[key]; ok {
-		sess.lastActivity = time.Now()
+		sess.lastActivity.Store(nowNanoUDP())
 		return sess
 	}
 	target, err := p.balancer.Pick(clientAddr.IP)
@@ -175,10 +181,14 @@ func (p *UDPProxy) getOrCreateSession(clientAddr *net.UDPAddr, key string) *udpS
 	}
 	connInfo = p.tracker.Register(connInfo)
 	sess = &udpSession{
-		upstream: upstreamConn, upstreamAddr: upstreamAddr,
-		target: target, connInfo: connInfo,
-		lastActivity: time.Now(), ctx: ctx, cancel: cancel,
+		upstream:     upstreamConn,
+		upstreamAddr: upstreamAddr,
+		target:       target,
+		connInfo:     connInfo,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
+	sess.lastActivity.Store(nowNanoUDP())
 	p.sessions[key] = sess
 	atomic.AddInt64(&p.activeConns, 1)
 	atomic.AddInt64(&p.totalConns, 1)
@@ -220,7 +230,7 @@ func (p *UDPProxy) readUpstream(key string, sess *udpSession, clientAddr *net.UD
 		if err != nil {
 			return
 		}
-		sess.lastActivity = time.Now()
+		sess.lastActivity.Store(nowNanoUDP())
 	}
 }
 
@@ -236,7 +246,7 @@ func (p *UDPProxy) reapSessions() {
 		p.sessionsMu.Lock()
 		now := time.Now()
 		for key, sess := range p.sessions {
-			if now.Sub(sess.lastActivity) > p.cfg.SessionTimeout {
+			if time.Duration(now.UnixNano()-sess.lastActivity.Load()) > p.cfg.SessionTimeout {
 				sess.cancel()
 				delete(p.sessions, key)
 			}
