@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/tests-69%20passing-brightgreen?style=flat-square" alt="Tests">
   <img src="https://img.shields.io/badge/coverage-80.9%25%20(l7)-green?style=flat-square" alt="Coverage">
   <img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go">
-  <img src="https://img.shields.io/badge/endpoints-36-orange?style=flat-square" alt="API Endpoints">
+  <img src="https://img.shields.io/badge/endpoints-46+-orange?style=flat-square" alt="API Endpoints">
 </p>
 
 ---
@@ -41,7 +41,7 @@
 | **Load Balancing** | ✅ 5 algorithms | ✅ 10+ algorithms | ✅ Round-robin | ✅ Round-robin |
 | **Health Checks** | ✅ Active TCP probes | ✅ Active + Passive | ✅ | ✅ |
 | **Metrics Format** | Prometheus + InfluxDB + CSV + JSON | Prometheus (exporter) | Prometheus + OTEL | Prometheus |
-| **REST API** | ✅ 36 endpoints, API-key auth | ⚠️ Stats socket (text) | ✅ Dashboard | ✅ Admin API |
+| **REST API** | ✅ 46+ endpoints, API-key auth, dashboard-ready | ⚠️ Stats socket (text) | ✅ Dashboard | ✅ Admin API |
 | **YAML Config** | ✅ Simple, flat structure | Custom DSL | YAML/TOML/KV | Caddyfile/JSON |
 | **Hot Reload** | ✅ Per-proxy, zero downtime | ⚠️ Soft reload | ✅ | ✅ Graceful |
 | **TLS Termination** | ⚠️ Passthrough only | ✅ Full | ✅ Auto Let's Encrypt | ✅ Auto Let's Encrypt |
@@ -59,7 +59,7 @@
 
 ✅ **DDoS mitigation** — layered defense: iptables drops volumetrics at kernel level, L7 catches slow/app-layer attacks.
 
-✅ **API-driven infrastructure** — 36 REST endpoints for full programmatic control. No config file editing needed at runtime.
+✅ **API-driven infrastructure** — 46+ REST endpoints for full programmatic control, including proxy CRUD, live stats, and historical time-series for building dashboards. No config file editing needed at runtime.
 
 ✅ **Bandwidth-constrained environments** — enforce hourly/daily/monthly quotas with auto-suspension. Perfect for metered hosting.
 
@@ -104,7 +104,8 @@ curl -H "X-API-Key: pk_admin_xxxxxxxxxxxx" "http://localhost:9000/metrics?format
 | [Getting Started](https://anaveragebeing.github.io/pingless-studios-docs/routex/getting-started/overview) | Overview, installation, quick start, FAQ |
 | [Global Config](https://anaveragebeing.github.io/pingless-studios-docs/routex/reference/global-config) | Every global setting explained |
 | [Proxy Config](https://anaveragebeing.github.io/pingless-studios-docs/routex/reference/proxy-config) | Every per-proxy field with use cases |
-| [API Reference](https://anaveragebeing.github.io/pingless-studios-docs/routex/api/endpoints) | All 36 endpoints documented |
+| [API Reference](https://anaveragebeing.github.io/pingless-studios-docs/routex/api/endpoints) | All 46+ endpoints documented |
+| [API.md (in repo)](docs/API.md) | Complete REST API reference with request/response examples |
 
 ---
 
@@ -151,9 +152,11 @@ curl -H "X-API-Key: pk_admin_xxxxxxxxxxxx" "http://localhost:9000/metrics?format
 - **Per-connection access logging** (accept, close, bytes, duration)
 - **L7 event stream** — queryable via API with search and limits
 
-### 🔌 36 REST API Endpoints
+### 🔌 46+ REST API Endpoints (dashboard-ready)
 
-Full CRUD for proxies, upstreams, ACL rules, iptables rules, L7 bans, bandwidth, and system config. API-key authentication with scoped permissions.
+Full CRUD for proxies (create/update/delete/enable/disable via API), upstreams, ACL rules, iptables rules, L7 bans, bandwidth, and system config. Live + historical (SQLite-backed) per-proxy stats, a one-call `/api/overview` for dashboard landing pages, and API-key authentication with scoped permissions.
+
+📖 **Full endpoint reference with examples:** [`docs/API.md`](docs/API.md)
 
 ---
 

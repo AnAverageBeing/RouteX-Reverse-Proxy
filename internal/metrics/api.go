@@ -17,6 +17,10 @@ func NewMetricsAPI(store *Store) *MetricsAPI {
 	return &MetricsAPI{store: store}
 }
 
+// Store exposes the underlying metrics store so the REST API can serve
+// historical time-series and aggregate dashboard queries.
+func (api *MetricsAPI) Store() *Store { return api.store }
+
 func (api *MetricsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
 	if format == "" {

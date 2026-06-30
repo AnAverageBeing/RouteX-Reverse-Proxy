@@ -190,6 +190,21 @@ func (m *Manager) StopAll() {
 }
 
 func (m *Manager) Get(name string) *Instance    { m.mu.RLock(); defer m.mu.RUnlock(); return m.instances[name] }
+
+// NameByConfigPath returns the name of the running proxy whose config was loaded
+// from the supplied file path, or "" if none. Used by the hot-reload watcher to
+// stop a proxy when its config file is deleted (the file is gone, so the name
+// can no longer be parsed from disk).
+func (m *Manager) NameByConfigPath(path string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for name, inst := range m.instances {
+		if inst.Config != nil && inst.Config.ConfigPath == path {
+			return name
+		}
+	}
+	return ""
+}
 func (m *Manager) List() []string {
 	m.mu.RLock(); defer m.mu.RUnlock()
 	names := make([]string, 0, len(m.instances))

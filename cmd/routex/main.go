@@ -192,7 +192,7 @@ func main() {
 
 	// ── API Server ────────────────────────────────────────────────────────
 	if global.API.Enabled {
-		apiRouter := api.NewRouter(global, proxyMgr, iptMgr, proxyMgr.AllL7Engines(), metAPI, logger, Version, globalACL, proxyACLs)
+		apiRouter := api.NewRouter(global, proxyMgr, iptMgr, proxyMgr.AllL7Engines(), metAPI, logger, Version, globalACL, proxyACLs, *proxiesDir)
 		var tlsCfg *api.TLSConfig
 		if global.API.TLS.Enabled {
 			tlsCfg = &api.TLSConfig{
@@ -226,23 +226,35 @@ func main() {
 						logger.Info("global config changed — full reload not yet supported; restart to apply")
 						continue
 					}
-					// Per-proxy file changed: reload only that proxy.
+					// File deleted: the file is gone so we can't parse a name from
+					// it — look the running proxy up by its config path and stop it.
+					if ch.Kind == config.ChangeRemove {
+						if name := proxyMgr.NameByConfigPath(ch.Path); name != "" {
+							proxyMgr.Stop(name)
+							logger.Info("hot reload: proxy removed (config deleted)",
+								zap.String("name", name), zap.String("path", ch.Path))
+						}
+						continue
+					}
+					// Per-proxy file created/modified: reload only that proxy.
 					p, loadErr := config.LoadProxy(ch.Path)
 					if loadErr != nil {
 						logger.Error("hot reload: config parse failed",
 							zap.String("path", ch.Path), zap.Error(loadErr))
 						continue
 					}
-					if ch.Kind == config.ChangeRemove {
+					// A config flipped to disabled must stop the running proxy.
+					if !p.Enabled {
 						proxyMgr.Stop(p.Name)
-						logger.Info("hot reload: proxy removed", zap.String("name", p.Name))
+						logger.Info("hot reload: proxy stopped (disabled in config)",
+							zap.String("name", p.Name))
+						continue
+					}
+					if startErr := proxyMgr.Start(p); startErr != nil {
+						logger.Error("hot reload: proxy restart failed",
+							zap.String("name", p.Name), zap.Error(startErr))
 					} else {
-						if startErr := proxyMgr.Start(p); startErr != nil {
-							logger.Error("hot reload: proxy restart failed",
-								zap.String("name", p.Name), zap.Error(startErr))
-						} else {
-							logger.Info("hot reload: proxy reloaded", zap.String("name", p.Name))
-						}
+						logger.Info("hot reload: proxy reloaded", zap.String("name", p.Name))
 					}
 				}
 			}

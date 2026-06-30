@@ -126,6 +126,51 @@ func (s *Store) Get(name string) *ProxyMetrics {
 	return s.cache[name]
 }
 
+// HistoryPoint is a single time-series sample of a proxy's metrics, used to
+// render dashboard graphs (connections/bandwidth over time).
+type HistoryPoint struct {
+	Timestamp         int64 `json:"timestamp"`
+	ActiveConnections int64 `json:"active_connections"`
+	TotalConnections  int64 `json:"total_connections"`
+	BytesIn           int64 `json:"bytes_in"`
+	BytesOut          int64 `json:"bytes_out"`
+	L7Blocked         int64 `json:"l7_blocked"`
+	L7Banned          int64 `json:"l7_banned"`
+	RateLimitedDrops  int64 `json:"rate_limited_drops"`
+}
+
+// History returns persisted time-series samples for a proxy since the given
+// unix timestamp, oldest first, capped at limit rows (0 = no cap, defaults
+// applied by the caller). It reads straight from SQLite so it survives restarts.
+func (s *Store) History(proxyName string, since int64, limit int) ([]HistoryPoint, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(
+		`SELECT timestamp, active_connections, total_connections, bytes_in, bytes_out,
+		        l7_blocked, l7_banned, rate_limited_drops
+		   FROM proxy_metrics
+		  WHERE proxy_name = ? AND timestamp >= ?
+		  ORDER BY timestamp ASC
+		  LIMIT ?`,
+		proxyName, since, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]HistoryPoint, 0, 64)
+	for rows.Next() {
+		var p HistoryPoint
+		if err := rows.Scan(&p.Timestamp, &p.ActiveConnections, &p.TotalConnections,
+			&p.BytesIn, &p.BytesOut, &p.L7Blocked, &p.L7Banned, &p.RateLimitedDrops); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Set(name string, update func(m *ProxyMetrics)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -18,17 +18,19 @@ import (
 )
 
 type Router struct {
-	mux       *chi.Mux
-	auth      *AuthMiddleware
-	manager   *proxy.Manager
-	iptMgr    *iptables.Manager
-	l7Engines map[string]*l7.Engine
-	metrics   *metrics.MetricsAPI
-	global    *config.Global
-	logger    *zap.Logger
-	version   string
-	globalACL *acl.Engine
-	proxyACLs map[string]*acl.Engine
+	mux        *chi.Mux
+	auth       *AuthMiddleware
+	manager    *proxy.Manager
+	iptMgr     *iptables.Manager
+	l7Engines  map[string]*l7.Engine
+	metrics    *metrics.MetricsAPI
+	global     *config.Global
+	logger     *zap.Logger
+	version    string
+	globalACL  *acl.Engine
+	proxyACLs  map[string]*acl.Engine
+	proxiesDir string
+	startTime  time.Time
 }
 
 func NewRouter(
@@ -41,6 +43,7 @@ func NewRouter(
 	version string,
 	globalACL *acl.Engine,
 	proxyACLs map[string]*acl.Engine,
+	proxiesDir string,
 ) *Router {
 	auth := NewAuthMiddleware(global)
 	r := &Router{
@@ -48,9 +51,19 @@ func NewRouter(
 		iptMgr: iptMgr, l7Engines: l7s, metrics: metAPI,
 		global: global, logger: logger, version: version,
 		globalACL: globalACL, proxyACLs: proxyACLs,
+		proxiesDir: proxiesDir, startTime: time.Now(),
 	}
 	r.registerRoutes()
 	return r
+}
+
+// L7EngineForProxy resolves the live L7 engine for a proxy from the manager,
+// falling back to the startup snapshot. Returns nil when L7 is disabled.
+func (r *Router) l7For(name string) *l7.Engine {
+	if eng := r.manager.GetL7Engine(name); eng != nil {
+		return eng
+	}
+	return r.l7Engines[name]
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -68,18 +81,42 @@ func (r *Router) registerRoutes() {
 		mux.HandleFunc("/metrics/*", r.metrics.ServeHTTP)
 	})
 
-	r.mux.Route("/api/proxies", func(mux chi.Router) {
+	// Read-only system / dashboard endpoints (proxies:read scope).
+	r.mux.Group(func(mux chi.Router) {
 		mux.Use(r.auth.RequirePermission("proxies:read"))
-		mux.Get("/", r.handleListProxies)
-		mux.Get("/{name}", r.handleGetProxy)
-		mux.Post("/{name}/enable", r.handleEnableProxy)
-		mux.Post("/{name}/disable", r.handleDisableProxy)
-		mux.Post("/{name}/reload", r.handleReloadProxy)
-		mux.Get("/{name}/connections", r.handleListConnections)
-		mux.Delete("/{name}/connections/{id}", r.handleKillConnection)
-		mux.Get("/{name}/upstreams", r.handleListUpstreams)
-		mux.Post("/{name}/upstreams/{ip}/eject", r.handleEjectUpstream)
-		mux.Post("/{name}/upstreams/{ip}/readmit", r.handleReadmitUpstream)
+		mux.Get("/api/system", r.handleSystem)
+		mux.Get("/api/overview", r.handleOverview)
+		mux.Get("/api/stats", r.handleGlobalStats)
+		mux.Get("/api/stats/proxy/{name}", r.handleProxyStats)
+		mux.Get("/api/stats/proxy/{name}/history", r.handleProxyHistory)
+	})
+
+	// API key introspection — admin only, never returns the secret value.
+	r.mux.Group(func(mux chi.Router) {
+		mux.Use(r.auth.RequirePermission("*"))
+		mux.Get("/api/keys", r.handleListKeys)
+	})
+
+	r.mux.Route("/api/proxies", func(mux chi.Router) {
+		// Reads.
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/", r.handleListProxies)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}", r.handleGetProxy)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}/config", r.handleGetProxyConfig)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}/connections", r.handleListConnections)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}/upstreams", r.handleListUpstreams)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}/l7", r.handleProxyL7)
+		mux.With(r.auth.RequirePermission("proxies:read")).Get("/{name}/ratelimits", r.handleGetRateLimits)
+		// Mutations (admin scope).
+		mux.With(r.auth.RequirePermission("*")).Post("/", r.handleCreateProxy)
+		mux.With(r.auth.RequirePermission("*")).Post("/validate", r.handleValidateProxy)
+		mux.With(r.auth.RequirePermission("*")).Put("/{name}", r.handleUpdateProxy)
+		mux.With(r.auth.RequirePermission("*")).Delete("/{name}", r.handleDeleteProxy)
+		mux.With(r.auth.RequirePermission("*")).Post("/{name}/enable", r.handleEnableProxy)
+		mux.With(r.auth.RequirePermission("*")).Post("/{name}/disable", r.handleDisableProxy)
+		mux.With(r.auth.RequirePermission("*")).Post("/{name}/reload", r.handleReloadProxy)
+		mux.With(r.auth.RequirePermission("*")).Delete("/{name}/connections/{id}", r.handleKillConnection)
+		mux.With(r.auth.RequirePermission("*")).Post("/{name}/upstreams/{ip}/eject", r.handleEjectUpstream)
+		mux.With(r.auth.RequirePermission("*")).Post("/{name}/upstreams/{ip}/readmit", r.handleReadmitUpstream)
 	})
 
 	r.mux.Route("/api/iptables", func(mux chi.Router) {
@@ -131,19 +168,55 @@ func (r *Router) handleVersion(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) handleListProxies(w http.ResponseWriter, req *http.Request) {
-	names := r.manager.List()
 	type proxyInfo struct {
-		Name    string `json:"name"`
-		Running bool   `json:"running"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Running     bool   `json:"running"`
+		Enabled     bool   `json:"enabled"`
+		Protocol    string `json:"protocol"`
+		OriginPort  string `json:"origin_port"`
+		ActiveConns int64  `json:"active_connections"`
+		ConfigPath  string `json:"config_path"`
 	}
-	out := make([]proxyInfo, 0, len(names))
-	for _, name := range names {
+	// Index running instances by name.
+	out := map[string]*proxyInfo{}
+	for _, name := range r.manager.List() {
 		inst := r.manager.Get(name)
-		if inst != nil {
-			out = append(out, proxyInfo{Name: name, Running: inst.IsRunning()})
+		if inst == nil {
+			continue
+		}
+		pi := &proxyInfo{Name: name, Running: inst.IsRunning(), ActiveConns: inst.Tracker().Live()}
+		if inst.Config != nil {
+			pi.Description = inst.Config.Description
+			pi.Enabled = inst.Config.Enabled
+			pi.Protocol = inst.Config.Protocol
+			pi.OriginPort = inst.Config.OriginPort
+			pi.ConfigPath = inst.Config.ConfigPath
+		}
+		out[name] = pi
+	}
+	// Merge in proxies that exist on disk but are not currently running (e.g.
+	// disabled), so a dashboard can list and re-enable them.
+	if r.proxiesDir != "" {
+		for _, res := range config.LoadProxyDir(r.proxiesDir) {
+			if res.Err != nil || res.Proxy == nil {
+				continue
+			}
+			if _, ok := out[res.Proxy.Name]; ok {
+				continue
+			}
+			out[res.Proxy.Name] = &proxyInfo{
+				Name: res.Proxy.Name, Description: res.Proxy.Description,
+				Running: false, Enabled: res.Proxy.Enabled, Protocol: res.Proxy.Protocol,
+				OriginPort: res.Proxy.OriginPort, ConfigPath: res.Path,
+			}
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	list := make([]*proxyInfo, 0, len(out))
+	for _, v := range out {
+		list = append(list, v)
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 func (r *Router) handleGetProxy(w http.ResponseWriter, req *http.Request) {
@@ -158,44 +231,87 @@ func (r *Router) handleGetProxy(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+// resolveProxyConfig finds a proxy's config either from the running instance or
+// by loading it fresh from disk (so disabled/stopped proxies are reachable too).
+func (r *Router) resolveProxyConfig(name string) (*config.Proxy, bool) {
+	if inst := r.manager.Get(name); inst != nil && inst.Config != nil {
+		return inst.Config, true
+	}
+	if r.proxiesDir != "" {
+		if path := config.FindProxyConfigPath(r.proxiesDir, name); path != "" {
+			if p, err := config.LoadProxy(path); err == nil {
+				return p, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (r *Router) handleEnableProxy(w http.ResponseWriter, req *http.Request) {
 	name := chi.URLParam(req, "name")
-	inst := r.manager.Get(name)
-	if inst == nil {
+	p, ok := r.resolveProxyConfig(name)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
 		return
 	}
-	if inst.Config != nil {
-		inst.Config.Enabled = true
+	p.Enabled = true
+	if _, err := config.SaveProxy(p, r.proxiesDir); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed: " + err.Error()})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "enabled"})
+	if err := r.manager.Start(p); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "enabled", "name": name})
 }
 
 func (r *Router) handleDisableProxy(w http.ResponseWriter, req *http.Request) {
 	name := chi.URLParam(req, "name")
-	inst := r.manager.Get(name)
-	if inst == nil {
+	p, ok := r.resolveProxyConfig(name)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
 		return
 	}
-	if inst.Config != nil {
-		inst.Config.Enabled = false
+	p.Enabled = false
+	if _, err := config.SaveProxy(p, r.proxiesDir); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed: " + err.Error()})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+	// Actually stop the running proxy so it stops accepting/forwarding traffic.
+	r.manager.Stop(name)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled", "name": name})
 }
 
 func (r *Router) handleReloadProxy(w http.ResponseWriter, req *http.Request) {
 	name := chi.URLParam(req, "name")
-	inst := r.manager.Get(name)
-	if inst == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy not found"})
+	// Reload from disk so on-disk edits are picked up (not just the in-memory copy).
+	path := ""
+	if inst := r.manager.Get(name); inst != nil && inst.Config != nil {
+		path = inst.Config.ConfigPath
+	}
+	if path == "" && r.proxiesDir != "" {
+		path = config.FindProxyConfigPath(r.proxiesDir, name)
+	}
+	if path == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "proxy config file not found"})
 		return
 	}
-	if err := r.manager.Start(inst.Config); err != nil {
+	p, err := config.LoadProxy(path)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "config reload failed: " + err.Error()})
+		return
+	}
+	if !p.Enabled {
+		r.manager.Stop(p.Name)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopped (disabled in config)", "name": p.Name})
+		return
+	}
+	if err := r.manager.Start(p); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded", "name": p.Name})
 }
 
 func (r *Router) handleListConnections(w http.ResponseWriter, req *http.Request) {
@@ -400,7 +516,46 @@ func (r *Router) handleL7Events(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) handleReloadAll(w http.ResponseWriter, req *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reload triggered"})
+	if r.proxiesDir == "" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "no proxies dir configured"})
+		return
+	}
+	results := config.LoadProxyDir(r.proxiesDir)
+	onDisk := map[string]bool{}
+	var started, stopped, failed int
+	var errs []string
+	for _, res := range results {
+		if res.Err != nil || res.Proxy == nil {
+			if res.Err != nil {
+				failed++
+				errs = append(errs, res.Err.Error())
+			}
+			continue
+		}
+		onDisk[res.Proxy.Name] = true
+		if !res.Proxy.Enabled {
+			r.manager.Stop(res.Proxy.Name)
+			stopped++
+			continue
+		}
+		if err := r.manager.Start(res.Proxy); err != nil {
+			failed++
+			errs = append(errs, res.Proxy.Name+": "+err.Error())
+		} else {
+			started++
+		}
+	}
+	// Stop any running proxy whose config file no longer exists on disk.
+	for _, name := range r.manager.List() {
+		if !onDisk[name] {
+			r.manager.Stop(name)
+			stopped++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "reloaded", "started": started, "stopped": stopped,
+		"failed": failed, "errors": errs,
+	})
 }
 
 // ─── ACL Handlers ─────────────────────────────────────────────────────────
