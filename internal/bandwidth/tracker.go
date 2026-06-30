@@ -103,6 +103,7 @@ func (t *Tracker) RecordIn(n int64) {
 	}
 	t.mu.Unlock()
 	bp.In.Add(n)
+	t.maybeCheckQuota()
 }
 
 // RecordOut adds outbound bytes to the tracker.
@@ -117,6 +118,19 @@ func (t *Tracker) RecordOut(n int64) {
 	}
 	t.mu.Unlock()
 	bp.Out.Add(n)
+	t.maybeCheckQuota()
+}
+
+// maybeCheckQuota re-evaluates quotas right after bytes are recorded so that
+// suspension takes effect promptly. Relying on the hourly cleanup loop alone
+// would delay enforcement by up to an hour, letting a proxy blow far past its
+// quota. It short-circuits once already suspended to bound the per-packet cost
+// on the UDP hot path.
+func (t *Tracker) maybeCheckQuota() {
+	if t.suspended.Load() {
+		return
+	}
+	t.CheckQuota()
 }
 
 // Suspended reports whether the proxy is currently suspended due to quota.

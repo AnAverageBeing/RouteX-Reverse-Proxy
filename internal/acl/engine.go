@@ -72,7 +72,9 @@ func NewEngine(name string, defaultAction Action, rules []Rule, enabled bool) (*
 
 // Check evaluates the source IP against all rules in order.
 func (e *Engine) Check(ip net.IP) string {
-	if !e.enabled || ip == nil {
+	// Defensive: a nil engine (e.g. a typed-nil *Engine stored in an ACLChecker
+	// interface) must never panic — treat it as "no ACL configured" = allow.
+	if e == nil || !e.enabled || ip == nil {
 		return string(Allow)
 	}
 	e.mu.RLock()

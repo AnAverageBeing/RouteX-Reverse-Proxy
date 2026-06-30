@@ -10,6 +10,7 @@ import (
 	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/bandwidth"
 	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/config"
 	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/health"
+	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/l7"
 	"github.com/AnAverageBeing/RouteX-Reverse-Proxy/internal/lb"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -34,6 +35,9 @@ type Instance struct {
 
 	// bwTracker is stored here so Stop() can call Close() to stop the cleanup goroutine.
 	bwTracker *bandwidth.Tracker
+
+	// l7Engine is stored here so Stop() can stop its cleanup goroutine.
+	l7Engine *l7.Engine
 }
 
 type Manager struct {
@@ -49,6 +53,7 @@ type Manager struct {
 	globalACL         ACLChecker
 	proxyACLs         map[string]ACLChecker
 	bandwidthTrackers map[string]*bandwidth.Tracker
+	l7Engines         map[string]*l7.Engine
 }
 
 func NewManager(global *config.Global, logger *zap.Logger) *Manager {
@@ -58,6 +63,7 @@ func NewManager(global *config.Global, logger *zap.Logger) *Manager {
 		instances:         make(map[string]*Instance),
 		proxyACLs:         make(map[string]ACLChecker),
 		bandwidthTrackers: make(map[string]*bandwidth.Tracker),
+		l7Engines:         make(map[string]*l7.Engine),
 	}
 }
 
@@ -80,6 +86,15 @@ func (m *Manager) AllBandwidthTrackers() map[string]*bandwidth.Tracker {
 	for k, v := range m.bandwidthTrackers { out[k] = v }
 	return out
 }
+func (m *Manager) GetL7Engine(name string) *l7.Engine {
+	m.mu.RLock(); defer m.mu.RUnlock(); return m.l7Engines[name]
+}
+func (m *Manager) AllL7Engines() map[string]*l7.Engine {
+	m.mu.RLock(); defer m.mu.RUnlock()
+	out := make(map[string]*l7.Engine, len(m.l7Engines))
+	for k, v := range m.l7Engines { out[k] = v }
+	return out
+}
 
 func (m *Manager) getComposedACL(proxyName string) ACLChecker {
 	m.mu.RLock()
@@ -99,16 +114,41 @@ func (c *composedACL) Check(ip net.IP) string {
 	return c.second.Check(ip)
 }
 
+// dynamicACL resolves the composed ACL for a proxy on every Check, rather than
+// snapshotting it at build time. This is required because the per-proxy ACL is
+// registered (via SetProxyACL) by the manager's onInstanceStart hook, which
+// runs AFTER buildInstance returns — a static snapshot taken in buildInstance
+// would always miss it, silently disabling per-proxy ACL rules for live traffic.
+type dynamicACL struct {
+	mgr  *Manager
+	name string
+}
+
+func (d *dynamicACL) Check(ip net.IP) string {
+	c := d.mgr.getComposedACL(d.name)
+	if c == nil {
+		return "allow"
+	}
+	return c.Check(ip)
+}
+
 func (m *Manager) Start(proxy *config.Proxy) error {
-	m.mu.Lock()
-	if _, ok := m.instances[proxy.Name]; ok {
-		m.mu.Unlock(); m.Stop(proxy.Name); m.mu.Lock()
+	// If an instance with this name already exists, stop it first. We must not
+	// hold m.mu while building the instance: buildInstance calls
+	// getComposedACL (RLock) and registers the bandwidth tracker (Lock), and
+	// Go's sync.RWMutex is NOT reentrant — holding the write lock here and
+	// re-acquiring it inside buildInstance self-deadlocks the goroutine.
+	m.mu.RLock()
+	_, exists := m.instances[proxy.Name]
+	m.mu.RUnlock()
+	if exists {
+		m.Stop(proxy.Name)
 	}
 	inst, err := m.buildInstance(proxy)
 	if err != nil {
-		m.mu.Unlock()
 		return fmt.Errorf("proxy %s: build failed: %w", proxy.Name, err)
 	}
+	m.mu.Lock()
 	m.instances[proxy.Name] = inst
 	m.mu.Unlock()
 	if err := inst.Start(); err != nil {
@@ -125,6 +165,9 @@ func (m *Manager) Stop(name string) {
 	inst, ok := m.instances[name]
 	if !ok { m.mu.Unlock(); return }
 	delete(m.instances, name)
+	delete(m.l7Engines, name)
+	delete(m.bandwidthTrackers, name)
+	delete(m.proxyACLs, name)
 	m.mu.Unlock()
 	if m.onInstanceStop != nil { m.onInstanceStop(inst) }
 	inst.Stop()
@@ -135,6 +178,9 @@ func (m *Manager) StopAll() {
 	m.mu.Lock()
 	insts := m.instances
 	m.instances = make(map[string]*Instance)
+	m.l7Engines = make(map[string]*l7.Engine)
+	m.bandwidthTrackers = make(map[string]*bandwidth.Tracker)
+	m.proxyACLs = make(map[string]ACLChecker)
 	m.mu.Unlock()
 	for name, inst := range insts {
 		if m.onInstanceStop != nil { m.onInstanceStop(inst) }
@@ -216,7 +262,8 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	tracker := NewConnTracker()
 	instLogger := m.logger.With(zap.String("proxy", proxy.Name))
 	timeouts := m.resolveTimeouts(proxy)
-	acl := m.getComposedACL(proxy.Name)
+	// Resolve the composed ACL dynamically per-connection (see dynamicACL).
+	var aclChecker ACLChecker = &dynamicACL{mgr: m, name: proxy.Name}
 	accessLog := proxy.Logging.LogConnections
 
 	// Bandwidth tracker — stored on Instance so Stop() can close it.
@@ -232,7 +279,22 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 			Weekly: proxy.Bandwidth.WeeklyLimit, Monthly: proxy.Bandwidth.MonthlyLimit,
 		}, loc)
 		bwRec = bwTracker
+		// buildInstance no longer runs under m.mu, so guard this map write.
+		m.mu.Lock()
 		m.bandwidthTrackers[proxy.Name] = bwTracker
+		m.mu.Unlock()
+	}
+
+	// L7 protection engine — created here (before the proxies) and assigned to
+	// each TCP/UDP proxy so it actually inspects live traffic. Previously the
+	// engine was built in main.go's onInstanceStart hook and only exposed to the
+	// REST API, so payload inspection / behavioral bans never ran on connections.
+	var l7Engine *l7.Engine
+	if proxy.L7Protection.Enabled {
+		l7Engine = l7.NewEngine(proxy.L7Protection)
+		m.mu.Lock()
+		m.l7Engines[proxy.Name] = l7Engine
+		m.mu.Unlock()
 	}
 
 	var tcpProxies []*TCPProxy
@@ -254,8 +316,9 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 					TCPNoDelay:           m.global.Network.TCPNoDelay,
 					SocketBufferSize:     m.global.Network.SocketBufferSize,
 					AccessLog:            accessLog,
-				}, balancerAdapter, resolver, tracker, instLogger, acl, bwRec)
+				}, balancerAdapter, resolver, tracker, instLogger, aclChecker, bwRec)
 				if err != nil { return nil, fmt.Errorf("tcp proxy port %d: %w", port, err) }
+				if l7Engine != nil { tcp.l7 = l7Engine }
 				tcpProxies = append(tcpProxies, tcp)
 			}
 			if proxy.Protocol == "udp" || proxy.Protocol == "tcp-udp" {
@@ -264,8 +327,9 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 					ReadBufferSize:  m.global.Network.UDPReadBuffer,
 					WriteBufferSize: m.global.Network.UDPWriteBuffer,
 					SessionTimeout:  timeouts.UDPSessionTimeout,
-				}, balancerAdapter, resolver, tracker, instLogger, acl, bwRec)
+				}, balancerAdapter, resolver, tracker, instLogger, aclChecker, bwRec)
 				if err != nil { return nil, fmt.Errorf("udp proxy port %d: %w", port, err) }
+				if l7Engine != nil { udp.l7 = l7Engine }
 				udpProxies = append(udpProxies, udp)
 			}
 		}
@@ -288,8 +352,16 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 	if hcOverride.FailuresBeforeEject > 0 { hcCfg.FailuresBeforeEject = hcOverride.FailuresBeforeEject }
 	if hcOverride.PassesBeforeReadmit > 0 { hcCfg.PassesBeforeReadmit = hcOverride.PassesBeforeReadmit }
 
-	checker, err := health.New(hcCfg, healthTargets, bal.SetHealth, instLogger)
-	if err != nil { return nil, fmt.Errorf("health checker: %w", err) }
+	// Active health checks dial TCP. For a UDP-only proxy that probe is
+	// meaningless and will permanently eject the (UDP-only) upstream, starving
+	// all UDP traffic. So we skip the checker for udp-only proxies and leave
+	// every upstream healthy (matching HAProxy's default UDP behavior). tcp and
+	// tcp-udp proxies still get real TCP health checking.
+	var checker *health.Checker
+	if proxy.Protocol != "udp" {
+		checker, err = health.New(hcCfg, healthTargets, bal.SetHealth, instLogger)
+		if err != nil { return nil, fmt.Errorf("health checker: %w", err) }
+	}
 
 	// FIX: sticky table cleanup goroutine is now bound to the instance context
 	// so it stops when the proxy stops (previously leaked forever).
@@ -307,6 +379,7 @@ func (m *Manager) buildInstance(proxy *config.Proxy) (*Instance, error) {
 		Name: proxy.Name, Config: proxy, global: m.global, logger: instLogger,
 		tcp: tcpProxies, udp: udpProxies, balancer: balancerAdapter,
 		tracker: tracker, checker: checker, bwTracker: bwTracker,
+		l7Engine: l7Engine,
 	}, nil
 }
 
@@ -317,7 +390,9 @@ func (inst *Instance) Start() error {
 	inst.cancel = cancel
 	eg, egCtx := errgroup.WithContext(ctx)
 	inst.eg = eg
-	if err := inst.checker.Start(egCtx); err != nil { cancel(); return err }
+	if inst.checker != nil {
+		if err := inst.checker.Start(egCtx); err != nil { cancel(); return err }
+	}
 	for _, tcp := range inst.tcp {
 		tcp := tcp; eg.Go(func() error { return tcp.Start(egCtx) })
 	}
@@ -344,9 +419,12 @@ func (inst *Instance) Stop() {
 	copy(udp, inst.udp)
 	checker := inst.checker
 	bwTracker := inst.bwTracker
+	l7Engine := inst.l7Engine
 	inst.mu.Unlock()
 
-	checker.Stop()
+	if checker != nil {
+		checker.Stop()
+	}
 	if cancel != nil { cancel() }
 
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -358,6 +436,10 @@ func (inst *Instance) Stop() {
 	// FIX: close bandwidth tracker to stop its hourly cleanup goroutine.
 	if bwTracker != nil {
 		bwTracker.Close()
+	}
+	// Stop the L7 engine's cleanup goroutine to prevent a goroutine leak.
+	if l7Engine != nil {
+		l7Engine.Stop()
 	}
 }
 

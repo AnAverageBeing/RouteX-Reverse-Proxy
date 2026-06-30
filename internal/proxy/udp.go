@@ -26,6 +26,7 @@ type UDPProxy struct {
 	// ignored and UDP bytes never counted toward bandwidth quotas)
 	acl   ACLChecker
 	bwRec BytesRecorder
+	l7    L7Checker
 
 	acceptCtx    context.Context
 	acceptCancel context.CancelFunc
@@ -113,9 +114,27 @@ func (p *UDPProxy) Start(ctx context.Context) error {
 			}
 		}
 
+		// Bandwidth suspension: drop all datagrams while over quota.
+		if isSuspended(p.bwRec) {
+			continue
+		}
+
 		// FIX #8: ACL check per source IP for UDP (was completely missing before)
 		if p.acl != nil && p.acl.Check(remoteAddr.IP) == "deny" {
 			continue
+		}
+
+		// L7 protection for UDP: drop datagrams from banned IPs and run per-datagram
+		// payload inspection / per-IP payload rate limiting. Each datagram is treated
+		// independently (UDP has no connection), so we inspect every packet.
+		if p.l7 != nil {
+			if p.l7.IsBanned(remoteAddr.IP) {
+				continue
+			}
+			inspected := false
+			if !p.l7.OnData(remoteAddr.IP, buf[:n], &inspected) {
+				continue
+			}
 		}
 
 		payload := make([]byte, n)
@@ -158,14 +177,20 @@ func (p *UDPProxy) getOrCreateSession(clientAddr *net.UDPAddr, key string) *udpS
 	if err != nil {
 		return nil
 	}
-	destPorts, err := p.resolver.DestPortsFor(p.cfg.OriginPort)
-	if err != nil || len(destPorts) == 0 {
-		p.balancer.Release(target)
-		return nil
+	// Dest port selection mirrors the TCP path: one-to-one uses the resolver's
+	// positional pairing (balancer chooses IP only); fan-out uses the balancer's
+	// chosen target port so load balancing spreads across all dest ports.
+	var destPort int
+	if p.resolver.IsOneToOne() {
+		destPorts, err := p.resolver.DestPortsFor(p.cfg.OriginPort)
+		if err != nil || len(destPorts) == 0 {
+			p.balancer.Release(target)
+			return nil
+		}
+		destPort = destPorts[0]
+	} else {
+		destPort = target.Port()
 	}
-	// FIX #4 (UDP side): use the resolver-determined dest port for one-to-one
-	// mapping. destPorts[0] is the correct mapped port for this origin port.
-	destPort := destPorts[0]
 	upstreamAddr := &net.UDPAddr{IP: target.IP(), Port: destPort}
 	upstreamConn, err := net.DialUDP("udp", nil, upstreamAddr)
 	if err != nil {

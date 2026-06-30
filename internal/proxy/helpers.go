@@ -1,5 +1,21 @@
 package proxy
 
+// suspendChecker is implemented by the bandwidth tracker. We probe the
+// BytesRecorder for it via type assertion so the proxy can enforce bandwidth
+// suspension without coupling its constructor signature to the bandwidth package.
+type suspendChecker interface {
+	Suspended() bool
+}
+
+// isSuspended reports whether the supplied recorder (if any) has tripped its
+// bandwidth quota. A nil recorder or one without quota support is never suspended.
+func isSuspended(rec BytesRecorder) bool {
+	if sc, ok := rec.(suspendChecker); ok {
+		return sc.Suspended()
+	}
+	return false
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

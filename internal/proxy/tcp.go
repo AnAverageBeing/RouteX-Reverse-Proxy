@@ -29,6 +29,7 @@ type TCPProxy struct {
 
 	acl   ACLChecker
 	bwRec BytesRecorder
+	l7    L7Checker
 
 	// FIX: acceptCancel is written by Start() and read by Stop() from different
 	// goroutines. Guard it with a mutex to prevent the data race.
@@ -45,6 +46,17 @@ type TCPProxy struct {
 
 type ACLChecker interface {
 	Check(ip net.IP) string
+}
+
+// L7Checker is implemented by the l7.Engine. It gates connections at accept
+// time (bans, connection cycling) and inspects the first client payload
+// (protocol validation, per-IP payload rate limiting). A nil L7Checker means
+// L7 protection is disabled for this proxy — the default.
+type L7Checker interface {
+	OnAccept(srcIP net.IP) bool
+	OnData(srcIP net.IP, payload []byte, inspected *bool) bool
+	IsBanned(ip net.IP) bool
+	NeedsFirstPayload() bool
 }
 
 type TCPConfig struct {
@@ -115,9 +127,31 @@ func (p *TCPProxy) Start(ctx context.Context) error {
 		srcIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 		srcAddr := net.ParseIP(srcIP)
 
+		// Bandwidth suspension: when the proxy has exceeded its quota it must
+		// stop accepting/forwarding traffic entirely. Reject new connections.
+		if isSuspended(p.bwRec) {
+			if p.cfg.AccessLog {
+				p.logger.Info("connection rejected — proxy suspended (bandwidth quota)",
+					zap.String("src", srcIP), zap.String("proxy", p.proxyName))
+			}
+			conn.Close()
+			continue
+		}
+
 		if p.acl != nil && p.acl.Check(srcAddr) == "deny" {
 			if p.cfg.AccessLog {
 				p.logger.Info("connection denied by ACL",
+					zap.String("src", srcIP), zap.String("proxy", p.proxyName))
+			}
+			conn.Close()
+			continue
+		}
+
+		// L7 accept-time gate: banned IPs and connection-cycling abuse are
+		// rejected before we spend resources dialing the upstream.
+		if p.l7 != nil && !p.l7.OnAccept(srcAddr) {
+			if p.cfg.AccessLog {
+				p.logger.Info("connection blocked by L7 (accept)",
 					zap.String("src", srcIP), zap.String("proxy", p.proxyName))
 			}
 			conn.Close()
@@ -162,14 +196,24 @@ func (p *TCPProxy) handleConn(client net.Conn) {
 	}
 	defer p.balancer.Release(target)
 
-	destPorts, err := p.resolver.DestPortsFor(p.cfg.OriginPort)
-	if err != nil || len(destPorts) == 0 {
-		return
+	// Dest port selection depends on mapping mode:
+	//   one-to-one: the dest port is fixed by the resolver's positional pairing
+	//     (origin port → single dest port); the balancer only chooses the IP.
+	//   fan-out:    the balancer's chosen target already encodes the dest port
+	//     (targets are the full destIP×destPort cross-product), so we must use
+	//     target.Port(). Previously destPorts[0] was always used, which pinned
+	//     every fan-out connection to the first dest port and defeated load
+	//     balancing across ports.
+	var destPort int
+	if p.resolver.IsOneToOne() {
+		destPorts, err := p.resolver.DestPortsFor(p.cfg.OriginPort)
+		if err != nil || len(destPorts) == 0 {
+			return
+		}
+		destPort = destPorts[0]
+	} else {
+		destPort = target.Port()
 	}
-	// FIX #4: use resolver-determined dest port for one-to-one mapping.
-	// destPorts[0] is the correct mapped port for this origin port.
-	// Previously target.Port() was used, which ignores the resolver entirely.
-	destPort := destPorts[0]
 	upstreamAddr := net.JoinHostPort(target.IP().String(), itoa(destPort))
 
 	connInfo := &ConnInfo{
@@ -194,6 +238,43 @@ func (p *TCPProxy) handleConn(client net.Conn) {
 		return
 	}
 	defer upstream.Close()
+
+	// L7 first-payload inspection: read the initial client payload, validate it
+	// (protocol detection + per-IP payload rate limiting), then forward it to the
+	// upstream before starting the bidirectional copy. Adds a single extra read on
+	// the first chunk only — no latency for the steady-state stream. A client that
+	// sends nothing within the read deadline is dropped (slow-connection defense).
+	if p.l7 != nil && p.l7.NeedsFirstPayload() {
+		deadline := p.cfg.ClientReadTimeout
+		if deadline <= 0 {
+			deadline = 5 * time.Second
+		}
+		_ = client.SetReadDeadline(time.Now().Add(deadline))
+		first := make([]byte, 4096)
+		n, rerr := client.Read(first)
+		_ = client.SetReadDeadline(time.Time{})
+		if n > 0 {
+			inspected := false
+			if !p.l7.OnData(srcAddr, first[:n], &inspected) {
+				if p.cfg.AccessLog {
+					p.logger.Info("connection dropped by L7 (payload)",
+						zap.String("src", srcIP), zap.String("proxy", p.proxyName))
+				}
+				return
+			}
+			if _, werr := upstream.Write(first[:n]); werr != nil {
+				return
+			}
+			atomic.AddInt64(&p.bytesIn, int64(n))
+			atomic.AddInt64(&connInfo.bytesIn, int64(n))
+			if p.bwRec != nil {
+				p.bwRec.RecordIn(int64(n))
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 
 	errCh := make(chan error, 2)
 

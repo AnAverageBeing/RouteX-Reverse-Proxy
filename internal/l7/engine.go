@@ -141,6 +141,18 @@ func (e *Engine) OnAccept(srcIP net.IP) bool {
 	return true
 }
 
+// NeedsFirstPayload reports whether this engine must see the first client
+// payload to do its job (protocol inspection or per-IP payload rate limiting).
+// When false, the proxy can skip the blocking first-read and avoid stalling
+// server-speaks-first protocols that have L7 enabled only for accept-time gating
+// (bans / connection cycling).
+func (e *Engine) NeedsFirstPayload() bool {
+	if !e.cfg.Enabled {
+		return false
+	}
+	return e.cfg.PayloadInspection.Enabled || e.cfg.PayloadRateLimit.Enabled
+}
+
 func (e *Engine) OnData(srcIP net.IP, payload []byte, inspected *bool) bool {
 	if !e.cfg.Enabled || srcIP == nil {
 		return true
